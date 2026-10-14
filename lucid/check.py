@@ -18,7 +18,7 @@ def main() -> None:
     try:
         provider = llm.provider_kind()
         if not llm.provider_ready():
-            print("Configure OPENAI_API_KEY or install and sign in to Kiro CLI.")
+            print("Configure OPENAI_API_KEY or install and sign in to Kiro CLI or Codex CLI.")
             return
         model = llm.default_model()
     except ValueError:

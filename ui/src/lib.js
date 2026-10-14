@@ -64,9 +64,9 @@ export function validateModel(model) {
   return typeof model === 'string' && model.length > 0 && model.length <= 256 && !/[\s\u0000-\u001f\u007f]/u.test(model)
     ? null : 'Enter a valid model ID without whitespace or control characters, or leave blank to use a valid backend default.';
 }
-export function modelIds(data) {
+export function modelIds(data, providerKind) {
   if (!Array.isArray(data?.models) || data.models.some((model) => validateModel(model?.id))) {
-    throw new Error('The API returned an invalid model list. You can still enter a model ID manually.');
+    throw new Error(providerKind === 'codex' ? 'The API returned an invalid Codex model list. Reload the catalog or use the backend default. No inference was requested.' : 'The API returned an invalid model list. You can still enter a model ID manually.');
   }
   return [...new Set(data.models.map((model) => model.id))].sort();
 }
@@ -75,6 +75,7 @@ export async function request(path, { signal, method = 'GET', body, timeoutMs = 
   const timeout = AbortSignal.timeout(timeoutMs);
   const githubPreview = path === '/api/github/preview';
   const modelsRequest = path.split('?')[0] === '/api/models';
+  const codexModels = modelsRequest && new URLSearchParams(path.split('?')[1]).get('provider') === 'codex';
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let response;
   try {
@@ -86,7 +87,7 @@ export async function request(path, { signal, method = 'GET', body, timeoutMs = 
   } catch (error) {
     if (signal?.aborted) throw error;
     throw new Error(timeout.aborted
-      ? modelsRequest ? 'Model loading timed out. Check the backend and provider connectivity, or enter a model ID manually.' : githubPreview ? 'Repository preview timed out. Check the backend and GitHub connectivity, then preview again. No model calls were requested.' : 'The local API timed out. Check the backend on 127.0.0.1:8765 and refresh history before retrying a scan.'
+      ? modelsRequest ? codexModels ? 'Codex model loading timed out. Check the backend, Codex CLI installation, and codex login, then reload the catalog. No inference was requested.' : 'Model loading timed out. Check the backend and provider connectivity, or enter a model ID manually.' : githubPreview ? 'Repository preview timed out. Check the backend and GitHub connectivity, then preview again. No model calls were requested.' : 'The local API timed out. Check the backend on 127.0.0.1:8765 and refresh history before retrying a scan.'
       : 'Cannot reach the local API. Start the backend on 127.0.0.1:8765, then retry.');
   }
   const text = await response.text();
@@ -107,6 +108,7 @@ export async function request(path, { signal, method = 'GET', body, timeoutMs = 
         [503, 'Provider service failed (HTTP 503). Check provider service status.'],
         [504, 'Provider service timed out (HTTP 504). Try loading models later.'],
       ]).get(data?.provider_status);
+      if (data?.provider_error_code === 'codex' || codexModels) throw new Error(`API ${response.status}: Could not load Codex models. Check Codex CLI installation and run codex login on the backend, then reload the catalog. Provider error details are hidden. No inference was requested.`);
       if (data?.provider_error_code === 'kiro') throw new Error(`API ${response.status}: Could not load Kiro models. Check Kiro CLI installation and run kiro-cli login on the backend. The CLI must support ACP and expose a model catalog. No inference was requested.`);
       throw new Error(`API ${response.status}: Could not load models. ${advice || 'Check the backend and provider configuration, or enter a model ID manually. Provider error details are hidden.'} No inference was requested.`);
     }

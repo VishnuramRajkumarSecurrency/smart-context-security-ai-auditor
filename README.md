@@ -178,7 +178,7 @@ python -m lucid.web
 ```
 
 No Requesty/OpenAI key is needed for Kiro. In the dashboard's **Model provider**
-selector, choose **Automatic**, **API / Requesty**, or **Kiro CLI**. Choosing Kiro
+selector, choose **Automatic**, **API / Requesty**, **Kiro CLI**, or **Codex CLI**. Choosing Kiro
 checks the selected backend configuration and automatically loads its catalog
 into **Available Kiro models**, without sending an audit prompt. **Load models**
 refreshes the list manually; API catalogs remain explicit-only. Changing providers
@@ -191,7 +191,7 @@ compatible. A model catalog in `session/new` is required.
 
 Optional backend environment settings:
 
-- `LUCID_PROVIDER=auto` (default), `api`, or `kiro` to force a provider.
+- `LUCID_PROVIDER=auto` (default), `api`, `kiro`, or `codex` to force a provider.
 - `LUCID_KIRO_CLI=/absolute/path/to/kiro-cli` if the executable isn't on `PATH`.
 - `LUCID_KIRO_MODEL=<Kiro model ID>` for a Kiro-specific default. Otherwise
   `kiro-default` resolves to the session's current model before an audit starts;
@@ -216,6 +216,65 @@ if OS-level isolation is required. The adapter currently requires macOS/Linux
 (or a suitable Linux environment such as WSL); its process transport uses POSIX
 pipes/process groups.
 
+### Codex CLI with your existing login
+
+Install Codex CLI on the **machine running Lucid**, then authenticate there:
+
+```sh
+codex login
+codex --version
+python -m lucid.web
+```
+
+Choose **Codex CLI** in the dashboard's **Model provider** selector. Lucid
+loads **Available Codex models** automatically using app-server `model/list`;
+**Load models** refreshes the catalog. Catalog requests do not start inference,
+but may contact Codex services. CLI detection and catalog availability alone do
+not prove authentication or permission to run a model. Lucid never reads your
+Codex auth file or accepts ChatGPT subscription credentials in an API-key field.
+Your existing Codex login is managed by the CLI. An eligible ChatGPT plan can
+provide Codex usage without a separate API key; API-key-based Codex login may
+instead incur API billing. Account limits and model access still apply.
+
+Optional settings:
+
+- `LUCID_PROVIDER=codex` to make Codex the backend default.
+- `LUCID_CODEX_CLI=/absolute/path/to/codex` when it is not on `PATH`.
+- `LUCID_CODEX_MODEL=<Codex execution model ID>` to select a backend default.
+  Otherwise `codex-default` resolves to the catalog's default model before the
+  audit starts. API/Requesty model IDs are not reused. Every audit phase uses
+  the pinned Codex model, including all specialist lanes and the judge.
+
+Automatic selection prefers a nonempty `OPENAI_API_KEY`, then installed Kiro,
+then installed Codex. Explicit UI selection overrides this without changing the
+environment. There is no fallback after a failed request.
+
+The adapter's protocol and configuration were checked against **Codex CLI
+0.162.1**; authenticated inference was not tested. Other versions may require
+updates. It uses app-server stdio, a fresh process and ephemeral thread for each
+completion, and sends prompts through stdin rather than arguments or files.
+JSON mode is a prompt instruction; the normal finding parser still validates
+responses. Low/medium/high reasoning overrides are checked against the selected
+model's advertised capabilities before inference. Lucid starts no inference
+retries, but Codex's internal retries may consume additional usage. Specialist
+mode launches concurrent CLI processes and can hit account concurrency limits.
+
+Built-in tools/features are disabled where supported; the agent sandbox is
+read-only with network disabled, approval requests are never granted, and
+observed tool activity is rejected. Known 0.162.1 informational notices caused
+by disabling Code Mode and host skill discovery are allowed; unknown runtime
+warnings and configuration-fallback warnings still stop the operation. A
+successful final turn is required even after an informational notice.
+**This is not full OS/config isolation.**
+The CLI retains access to its normal auth/config location. Version 0.162.1
+app-server cannot ignore user config or restrict all read roots; inherited MCP
+servers can start before Lucid rejects events. Use only trusted Codex
+configuration, review existing MCP settings, and use an external sandbox/account
+if stronger isolation is needed. Ephemeral threads avoid persisted rollouts,
+but CLI auth refreshes, caches, and logs may still be written. Provider/GitHub
+credential environment variables are not forwarded to Codex. The adapter
+currently requires macOS/Linux POSIX pipes/process groups (or suitable WSL).
+
 ### GitHub targets
 
 Select **GitHub repository**, enter a repository root URL such as
@@ -225,8 +284,23 @@ use the default branch. File/tree/pull-request URLs are not supported.
 
 Click **Preview repository** to download and review the Solidity manifest and
 line-numbered source without an AI key or model charges. This contacts GitHub,
-so normal network access and anonymous GitHub rate limits apply. Only public
-repositories are supported; no GitHub credentials are accepted.
+so normal network access and GitHub rate limits apply. Public repositories use
+anonymous requests by default, even when a backend token is configured.
+
+For **private repositories**, configure `LUCID_GITHUB_TOKEN` in the backend's
+environment (or its local `.env`), restart Lucid, and check **Use backend GitHub
+token** before previewing. Use a fine-grained GitHub personal access token limited
+to the repositories you need, with **Contents: read-only** permission (repository
+metadata read access is included). Organization approval and SSO authorization
+may also be required. Do not commit the token, paste it into the repository URL,
+or share it with the browser. No token-entry field is exposed by the UI.
+
+Authenticated previews send the token only to `api.github.com`, use commit-pinned
+API source downloads, and never follow redirects. The token is not stored in
+previews, audit history, exports, or model prompts. Private source itself is
+returned to your local browser for review and is sent to the selected AI provider
+only when you authorize an audit. Use this local dashboard only on a trusted
+machine; GitHub access is separate from API/Kiro authentication.
 
 After previewing, use **Contracts in audit scope** to check the Solidity files
 that should be audited. All files start selected; **Select all** and **Clear

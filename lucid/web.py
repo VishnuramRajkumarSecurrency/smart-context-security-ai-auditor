@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import agent, context, judge, kiro, llm, specialists
+from . import agent, codex, context, judge, kiro, llm, specialists
 from .codebase import MAX_CHARS, load_codebase
 from .github import GitHubSourceError, fetch_repository
 from .schema import Finding
@@ -42,7 +42,7 @@ ALLOWED_ORIGINS = {
 
 def provider_error(exc: Exception) -> str:
     """Expose only SDK error categories/status codes, never provider text or bodies."""
-    if isinstance(exc, kiro.KiroError):
+    if isinstance(exc, (kiro.KiroError, codex.CodexError)):
         return str(exc)
     if isinstance(exc, openai.APIStatusError):
         messages = {
@@ -74,7 +74,7 @@ class AuditRequest(BaseModel):
     mode: Literal["single", "context", "loop", "specialists"] = "single"
     rounds: int = Field(default=5, ge=1, le=10)
     confirmed_paid: bool = False
-    provider: Literal["auto", "api", "kiro"] = "auto"
+    provider: Literal["auto", "api", "kiro", "codex"] = "auto"
     model: str | None = Field(default=None, max_length=256)
     json_mode: bool = True
     reasoning_effort: Literal["low", "medium", "high"] | None = None
@@ -93,6 +93,7 @@ class GitHubPreviewRequest(BaseModel):
     url: str = Field(min_length=1, max_length=256)
     ref: str = Field(default="", max_length=255)
     subdirectory: str = Field(default="", max_length=240)
+    authenticated: bool = False
 
 
 def uploaded_codebase(files: list[SourceFile]) -> str:
@@ -240,12 +241,12 @@ class AuditStore:
     def start(self, request: AuditRequest, codebase: str, source: dict | None = None) -> dict:
         provider = llm.provider_kind(request.provider)
         model = request.model if request.model is not None else llm.default_model(provider)
-        if provider == "kiro":
-            if request.reasoning_effort is not None:
+        if provider in ("kiro", "codex"):
+            if provider == "kiro" and request.reasoning_effort is not None:
                 raise HTTPException(400, "Kiro ACP does not support the reasoning effort option. Use provider default; no audit prompt was sent.")
             try:
-                model = kiro.resolve_model(model)
-            except kiro.KiroError as exc:
+                model = (kiro if provider == "kiro" else codex).resolve_model(model)
+            except (kiro.KiroError, codex.CodexError) as exc:
                 raise HTTPException(400, str(exc)) from None
         with self.lock:
             if any(job["status"] in ("queued", "running") for job in self.jobs.values()):
@@ -491,17 +492,17 @@ async def local_requests(request: Request, call_next):
 
 
 @app.get("/api/config")
-def config(provider: Literal["auto", "api", "kiro"] = "auto"):
+def config(provider: Literal["auto", "api", "kiro", "codex"] = "auto"):
     from urllib.parse import urlparse
     base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
     try:
         kind = llm.provider_kind(provider)
         ready = llm.provider_ready(kind)
     except ValueError:
-        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, or kiro.") from None
+        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, kiro, or codex.") from None
     return {
-        "model": os.environ.get("LUCID_KIRO_MODEL", kiro.DEFAULT_MODEL) if kind == "kiro" else os.environ.get("OPENAI_MODEL", llm.MODEL),
-        "provider": "Kiro CLI (ACP)" if kind == "kiro" else urlparse(base).hostname or "custom provider",
+        "model": llm.default_model(kind),
+        "provider": "Codex CLI" if kind == "codex" else "Kiro CLI (ACP)" if kind == "kiro" else urlparse(base).hostname or "custom provider",
         "provider_kind": kind, "provider_ready": ready,
         "key_configured": bool(os.environ.get("OPENAI_API_KEY")),
         "reasoning_supported": kind != "kiro",
@@ -511,20 +512,20 @@ def config(provider: Literal["auto", "api", "kiro"] = "auto"):
 
 
 @app.get("/api/models")
-def models(provider: Literal["auto", "api", "kiro"] = "auto"):
+def models(provider: Literal["auto", "api", "kiro", "codex"] = "auto"):
     try:
         kind = llm.provider_kind(provider)
     except ValueError:
-        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, or kiro.") from None
+        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, kiro, or codex.") from None
     if not llm.provider_ready(kind):
-        raise HTTPException(400, "Configure OPENAI_API_KEY or install and sign in to Kiro CLI on the backend.")
+        raise HTTPException(400, "Configure OPENAI_API_KEY or install and sign in to Kiro CLI or Codex CLI on the backend.")
     try:
         return {"models": llm.list_models(provider=kind)}
     except Exception as exc:  # Never expose provider exception details.
         return JSONResponse(status_code=502, content={
             "detail": f"Could not load provider models. {provider_error(exc)} No inference was requested.",
             "provider_status": exc.status_code if isinstance(exc, openai.APIStatusError) else None,
-            "provider_error_code": "kiro" if isinstance(exc, kiro.KiroError) else None,
+            "provider_error_code": "codex" if isinstance(exc, codex.CodexError) else "kiro" if isinstance(exc, kiro.KiroError) else None,
         })
 
 
@@ -545,7 +546,7 @@ def preview_github(body: GitHubPreviewRequest, request: Request):
     if not store.download_lock.acquire(blocking=False):
         raise HTTPException(409, "A GitHub preview is downloading. Wait for it to finish and retry.")
     try:
-        preview = fetch_repository(body.url, body.ref, body.subdirectory)
+        preview = fetch_repository(body.url, body.ref, body.subdirectory, authenticated=body.authenticated)
         codebase = uploaded_codebase([SourceFile.model_validate(file) for file in preview["files"]])
         return store.add(preview, codebase)
     except GitHubSourceError as exc:
@@ -563,9 +564,9 @@ def create_audit(body: AuditRequest, request: Request):
     try:
         kind = llm.provider_kind(body.provider)
     except ValueError:
-        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, or kiro.") from None
+        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, kiro, or codex.") from None
     if not llm.provider_ready(kind):
-        raise HTTPException(400, "Configure OPENAI_API_KEY or install and sign in to Kiro CLI on the backend, then restart.")
+        raise HTTPException(400, "Configure OPENAI_API_KEY or install and sign in to Kiro CLI or Codex CLI on the backend, then restart.")
     source = None
     try:
         if body.target == "github":

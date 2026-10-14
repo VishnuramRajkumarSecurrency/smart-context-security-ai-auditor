@@ -110,6 +110,40 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.client.get("/api/config").json()["provider_kind"], "api")
             self.assertEqual(dict(os.environ), before)
 
+    def test_codex_config_catalog_and_pinned_context_audit(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "", "LUCID_CODEX_MODEL": "codex-default"}), patch("lucid.codex.executable", return_value="/fake/codex"), patch("lucid.codex.list_models", return_value=[{"id": "codex-model"}]), patch("lucid.codex.resolve_model", return_value="codex-model") as resolve, patch("lucid.codex.complete", side_effect=["Protocol context", '{"findings": []}']) as complete, patch("lucid.llm._client") as api:
+            config = self.client.get("/api/config?provider=codex").json()
+            self.assertEqual(config["provider_kind"], "codex")
+            self.assertEqual(config["provider"], "Codex CLI")
+            self.assertEqual(config["model"], "codex-default")
+            self.assertTrue(config["provider_ready"])
+            self.assertTrue(config["reasoning_supported"])
+            self.assertFalse(config["key_configured"])
+            self.assertEqual(self.client.get("/api/models?provider=codex").json(), {"models": [{"id": "codex-model"}]})
+            complete.assert_not_called()
+            response = self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True, "provider": "codex", "mode": "context", "reasoning_effort": "high"})
+            self.assertEqual(response.status_code, 202)
+            job = self.wait(response.json()["id"])
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["provider_kind"], "codex")
+            self.assertEqual(job["model"], "codex-model")
+            resolve.assert_called_once_with("codex-default")
+            self.assertEqual(complete.call_count, 2)
+            for call in complete.call_args_list:
+                self.assertEqual(call.kwargs["model"], "codex-model")
+                self.assertEqual(call.kwargs["reasoning_effort"], "high")
+            api.assert_not_called()
+
+    def test_codex_catalog_preflight_errors_do_not_start_inference(self):
+        from lucid.codex import CodexError
+        with patch("lucid.codex.executable", return_value="/fake/codex"), patch("lucid.codex.list_models", side_effect=CodexError("Codex operation timed out.")), patch("lucid.codex.resolve_model", side_effect=CodexError("The selected model is not available in Codex.")), patch("lucid.codex.complete") as complete:
+            response = self.client.get("/api/models?provider=codex")
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.json()["provider_error_code"], "codex")
+            response = self.client.post("/api/audits", headers=HEADERS, json={"provider": "codex", "confirmed_paid": True})
+            self.assertEqual(response.status_code, 400)
+            complete.assert_not_called()
+
     def test_explicit_api_without_key_never_falls_back_to_kiro(self):
         with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": "", "OPENAI_MODEL": "api/default"}), patch("lucid.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.kiro.list_models") as catalog, patch("lucid.kiro.resolve_model") as resolve, patch("lucid.kiro.complete") as complete, patch("lucid.llm._client") as api:
             config = self.client.get("/api/config?provider=api").json()
@@ -345,6 +379,27 @@ class WebTests(unittest.TestCase):
         source, full = self.client.app.state.previews.get(preview["id"])
         self.assertEqual(source["scope_paths"], ["src/A.sol", "src/B.sol"])
         self.assertIn("Excluded", full)
+
+    def test_private_github_preview_keeps_authentication_backend_only(self):
+        snapshot = {
+            "repository_url": "https://github.com/owner/private", "repository": "owner/private",
+            "ref": "main", "commit": "a" * 40, "subdirectory": "",
+            "files": [{"path": "A.sol", "content": "contract A {}"}],
+            "file_count": 1, "total_chars": 13,
+        }
+        with patch.dict(os.environ, {"LUCID_GITHUB_TOKEN": "offline-secret"}), patch("lucid.web.fetch_repository", return_value=snapshot) as fetch, patch("lucid.web.llm.complete") as complete:
+            response = self.client.post("/api/github/preview", headers=HEADERS, json={"url": snapshot["repository_url"], "authenticated": True})
+            self.assertEqual(response.status_code, 200)
+            fetch.assert_called_once_with(snapshot["repository_url"], "", "", authenticated=True)
+            complete.assert_not_called()
+            self.assertNotIn("offline-secret", response.text)
+            source, codebase = self.client.app.state.previews.get(response.json()["id"])
+            self.assertNotIn("offline-secret", json.dumps(source) + codebase)
+        with patch.dict(os.environ, {"LUCID_GITHUB_TOKEN": ""}), patch("lucid.github.httpx.Client") as client:
+            response = self.client.post("/api/github/preview", headers=HEADERS, json={"url": snapshot["repository_url"], "authenticated": True})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("LUCID_GITHUB_TOKEN", response.text)
+            client.assert_not_called()
 
     def test_github_preview_errors_and_expiry(self):
         from lucid.github import GitHubSourceError

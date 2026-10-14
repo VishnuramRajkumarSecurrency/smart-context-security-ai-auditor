@@ -1,4 +1,4 @@
-"""Public GitHub preview tests: every request uses an offline mock transport."""
+"""GitHub preview tests: every request uses an offline mock transport."""
 
 import gzip
 import json
@@ -13,6 +13,7 @@ SHA = "a" * 40
 URL = "https://github.com/owner/repo"
 API = "https://api.github.com/repos/owner/repo"
 CLIENT = httpx.Client
+TOKEN = "offline-test-token"
 
 
 def blob(path: object = "src/A.sol", content=b"contract A {}", **overrides):
@@ -35,29 +36,47 @@ class Chunks(httpx.SyncByteStream):
 
 
 class GitHubTests(unittest.TestCase):
-    def fetch(self, *, entries=None, sources=None, handler=None, url=URL, ref="", subdirectory=""):
+    def setUp(self):
+        self.environment = patch("lucid.github.os.environ", {})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def fetch(self, *, entries=None, sources=None, handler=None, url=URL, ref="", subdirectory="",
+              authenticated=False, token=TOKEN, private=False):
         self.requests = []
         entries = [blob()] if entries is None else entries
         sources = {"src/A.sol": b"contract A {}"} if sources is None else sources
 
         def respond(request):
             self.requests.append(request)
-            self.assertNotIn("authorization", request.headers)
+            if authenticated:
+                self.assertEqual(request.url.host, "api.github.com")
+                self.assertEqual(request.headers["authorization"], f"Bearer {token}")
+            else:
+                self.assertNotIn("authorization", request.headers)
             self.assertNotIn("cookie", request.headers)
             self.assertEqual(request.headers["accept-encoding"], "identity")
             self.assertEqual(request.url.scheme, "https")
-            expected_accept = "application/vnd.github.sha" if "/commits/" in request.url.path else "application/vnd.github+json"
+            expected_accept = "application/vnd.github+json"
+            if "/commits/" in request.url.path:
+                expected_accept = "application/vnd.github.sha"
+            elif authenticated and "/contents/" in request.url.path:
+                expected_accept = "application/vnd.github.raw+json"
             self.assertEqual(request.headers["accept"], expected_accept)
             if handler:
                 response = handler(request)
                 if response is not None:
                     return response
             if str(request.url) == API:
-                return httpx.Response(200, json={"default_branch": "main", "private": False})
+                return httpx.Response(200, json={"default_branch": "main", "private": private})
             if request.url.path.startswith("/repos/owner/repo/commits/"):
                 return httpx.Response(200, content=SHA.encode("ascii"))
             if str(request.url) == f"{API}/git/trees/{SHA}?recursive=1":
                 return httpx.Response(200, json={"truncated": False, "tree": entries})
+            contents_prefix = "/repos/owner/repo/contents/"
+            if authenticated and request.url.path.startswith(contents_prefix):
+                self.assertEqual(request.url.params, httpx.QueryParams({"ref": SHA}))
+                return httpx.Response(200, content=sources[request.url.path[len(contents_prefix):]])
             prefix = f"/owner/repo/{SHA}/"
             if request.url.host == "raw.githubusercontent.com" and request.url.path.startswith(prefix):
                 return httpx.Response(200, content=sources[request.url.path[len(prefix):]])
@@ -69,8 +88,122 @@ class GitHubTests(unittest.TestCase):
             self.assertLessEqual(kwargs["timeout"], 10)
             return CLIENT(transport=httpx.MockTransport(respond), **kwargs)
 
-        with patch("lucid.github.httpx.Client", side_effect=client):
-            return github.fetch_repository(url, ref, subdirectory)
+        environment = {} if token is None else {"LUCID_GITHUB_TOKEN": token}
+        with patch.dict("os.environ", environment, clear=True), patch("lucid.github.httpx.Client", side_effect=client):
+            return github.fetch_repository(url, ref, subdirectory, authenticated=authenticated)
+
+    def test_authenticated_default_branch_and_private_repository(self):
+        result = self.fetch(authenticated=True, private=True)
+        self.assertEqual([str(request.url) for request in self.requests], [
+            API, f"{API}/commits/main", f"{API}/git/trees/{SHA}?recursive=1",
+            f"{API}/contents/src/A.sol?ref={SHA}",
+        ])
+        self.assertEqual(result["files"], [{"path": "src/A.sol", "content": "contract A {}"}])
+        self.assertNotIn(TOKEN, json.dumps(result))
+        self.assertNotIn("token", result)
+        self.assertNotIn("authenticated", result)
+        public_result = self.fetch(authenticated=True, private=False)
+        self.assertEqual(public_result, result)
+
+    def test_authenticated_slash_ref_and_quoted_source_are_pinned(self):
+        path, source = "src/space name-λ.sol", "// λ".encode()
+        result = self.fetch(authenticated=True, ref="feature/a-b", entries=[blob(path, source)],
+                            sources={path: source}, subdirectory="src")
+        self.assertEqual(result["ref"], "feature/a-b")
+        self.assertEqual(self.requests[0].url.raw_path, b"/repos/owner/repo/commits/feature%2Fa-b")
+        self.assertEqual(self.requests[-1].url.raw_path,
+                         b"/repos/owner/repo/contents/src/space%20name-%CE%BB.sol?ref=" + SHA.encode())
+        self.assertEqual(len(self.requests), 3)
+        self.assertNotIn(TOKEN, json.dumps(result))
+
+    def test_authenticated_missing_and_invalid_tokens_before_network(self):
+        invalid = [None, "", " ", " token", "token ", "to ken", "to\tken", "to\r\nken",
+                   "token\x00", "token\x1f", "token\x7f", "tokenλ", "token\u00a0", "x" * 4097]
+        for token in invalid:
+            with self.subTest(token=token), patch("lucid.github.httpx.Client") as client:
+                with self.assertRaisesRegex(github.GitHubSourceError, "LUCID_GITHUB_TOKEN"):
+                    self.fetch(authenticated=True, token=token)
+                client.assert_not_called()
+                self.assertEqual(self.requests, [])
+        with patch.dict("os.environ", {"GITHUB_TOKEN": TOKEN, "GH_TOKEN": TOKEN}, clear=True), \
+                patch("lucid.github.httpx.Client") as client:
+            with self.assertRaises(github.GitHubSourceError):
+                github.fetch_repository(URL, authenticated=True)
+            client.assert_not_called()
+
+    def test_authenticated_token_boundaries(self):
+        for token in ("!", "~", "x" * 4096, "!#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"):
+            with self.subTest(length=len(token)):
+                self.fetch(authenticated=True, token=token)
+
+    def test_anonymous_never_reads_environment_token(self):
+        class UnreadableEnvironment(dict):
+            def get(self, *args, **kwargs):
+                raise AssertionError("Environment read")
+
+        with patch("lucid.github.os.environ", UnreadableEnvironment()):
+            self.fetch(token=TOKEN)
+            self.fetch(token="invalid token\n")
+
+    def test_repository_visibility_requires_boolean_in_both_modes(self):
+        for authenticated in (False, True):
+            for value in (None, 0, 1, "false", "true", [], {}):
+                with self.subTest(authenticated=authenticated, value=value):
+                    with self.assertRaisesRegex(github.GitHubSourceError, "invalid repository visibility"):
+                        self.fetch(authenticated=authenticated, private=value)
+                    self.assertEqual(len(self.requests), 1)
+            with self.assertRaisesRegex(github.GitHubSourceError, "invalid repository visibility"):
+                self.fetch(authenticated=authenticated, handler=lambda request:
+                           httpx.Response(200, json={"default_branch": "main"}) if str(request.url) == API else None)
+
+    def test_authenticated_http_errors_and_redirects_are_redacted(self):
+        cases = [(401, {}, "authentication failed"), (404, {}, "token's repository access"),
+                 (403, {}, "permissions.*SSO"), (429, {}, "rate limit"),
+                 (403, {"x-ratelimit-remaining": "0"}, "rate limit"),
+                 (403, {"retry-after": "60"}, "rate limit"),
+                 (302, {"location": f"https://raw.githubusercontent.com/{TOKEN}"}, "redirect"),
+                 (307, {"location": f"{API}/contents/{TOKEN}"}, "redirect"), (500, {}, "retry later")]
+        for stage in ("metadata", "commit", "tree", "source"):
+            for status, headers, message in cases:
+                def handler(request, stage=stage, status=status, headers=headers):
+                    target = {"metadata": str(request.url) == API, "commit": "/commits/" in request.url.path,
+                              "tree": "/git/trees/" in request.url.path, "source": "/contents/" in request.url.path}[stage]
+                    return httpx.Response(status, headers=headers, content=TOKEN.encode()) if target else None
+                with self.subTest(stage=stage, status=status), self.assertRaisesRegex(github.GitHubSourceError, message) as caught:
+                    self.fetch(authenticated=True, handler=handler)
+                self.assertNotIn(TOKEN, str(caught.exception))
+                self.assertEqual(len(self.requests), ("metadata", "commit", "tree", "source").index(stage) + 1)
+
+    def test_authenticated_transport_errors_are_redacted(self):
+        for error, message in ((httpx.ReadTimeout(TOKEN), "timed out"),
+                               (httpx.ConnectError(TOKEN), "network connection")):
+            def handler(request, error=error):
+                if "/contents/" in request.url.path:
+                    raise error
+            with self.subTest(error=error), self.assertRaisesRegex(github.GitHubSourceError, message) as caught:
+                self.fetch(authenticated=True, handler=handler)
+            self.assertNotIn(TOKEN, str(caught.exception))
+            self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_authenticated_source_bounds_and_validation(self):
+        for content, message in ((b"short", "does not match"), (b"\xff" * 13, "UTF-8")):
+            with self.subTest(message=message), self.assertRaisesRegex(github.GitHubSourceError, message):
+                self.fetch(authenticated=True, sources={"src/A.sol": content})
+        stream = Chunks([b"x" * 400_000, b"x", b"not read"])
+        with self.assertRaisesRegex(github.GitHubSourceError, "400,000"):
+            self.fetch(authenticated=True, entries=[blob(size=400_000)], handler=lambda request:
+                       httpx.Response(200, stream=stream) if "/contents/" in request.url.path else None)
+        self.assertTrue(stream.closed)
+        self.assertEqual(stream.reads, 2)
+        with patch.object(github, "MAX_SOURCE_BYTES", 20), self.assertRaisesRegex(github.GitHubSourceError, "7-byte"):
+            self.fetch(authenticated=True, entries=[blob("A.sol"), blob("B.sol", b"")],
+                       sources={"A.sol": b"contract A {}", "B.sol": b"x" * 8})
+        for entries, message in (([blob(size=400_001)], "400,000"),
+                                 ([blob(f"{index}.sol", size=400_000) for index in range(5)], "1,600,000"),
+                                 ([blob(f"{index}.sol", b"") for index in range(201)], "200 Solidity")):
+            with self.subTest(message=message), self.assertRaisesRegex(github.GitHubSourceError, message):
+                self.fetch(authenticated=True, entries=entries)
+            self.assertEqual(len(self.requests), 3)
 
     def test_default_branch_and_commit_pinning(self):
         result = self.fetch(url=URL + ".git/")
@@ -268,7 +401,7 @@ class GitHubTests(unittest.TestCase):
     def test_http_errors_are_actionable_and_do_not_leak_response(self):
         cases = [(429, {}, "rate limit"), (403, {"x-ratelimit-remaining": "0"}, "rate limit"),
                  (403, {"retry-after": "60"}, "rate limit"), (403, {}, "denied"),
-                 (401, {}, "only public"), (404, {}, "only public"),
+                 (401, {}, "authentication failed"), (404, {}, "token's repository access"),
                  (302, {"location": "https://evil.example/secret"}, "redirect"), (500, {}, "retry later")]
         for stage in ("metadata", "commit", "tree", "raw"):
             for status, headers, message in cases:

@@ -14,6 +14,99 @@ const code = transformed.code.replace(/from "([^"]+)"|from '([^']+)'/g, (_match,
 });
 const { default: App } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 
+test('Codex CLI loads its catalog on selection, submits model IDs and reasoning, and ignores stale models and errors', async () => {
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
+  const originalFetch = globalThis.fetch;
+  const originals = new Map();
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, IS_REACT_ACT_ENVIRONMENT: true })) {
+    originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
+  }
+  const calls = [];
+  const pending = [];
+  let ready = true;
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options });
+    if (path === '/api/config' || path === '/api/config?provider=codex') return Response.json({ model: 'codex-default', provider: 'Codex CLI', provider_kind: 'codex', provider_ready: ready, key_configured: false, max_chars: 1000 });
+    if (path === '/api/config?provider=api') return Response.json({ model: 'api-model', provider: 'Requesty', provider_kind: 'api', provider_ready: true, key_configured: true });
+    if (path === '/api/models' || path === '/api/models?provider=codex') return new Promise((resolve, reject) => pending.push({ resolve, reject, signal: options.signal }));
+    if (path === '/api/audits' && options.method !== 'POST') return Response.json([]);
+    return Response.json({ id: 'codex-job', status: 'completed', findings: [], provider_kind: 'codex', model: 'codex-catalog-id' });
+  };
+  const root = createRoot(document.getElementById('root'));
+  const flush = async (fn = () => {}) => act(async () => { fn(); await new Promise((resolve) => setTimeout(resolve, 30)); });
+  const button = (text) => [...document.querySelectorAll('button')].find((element) => element.textContent.includes(text));
+  const edit = async (id, value) => flush(() => {
+    const input = document.getElementById(id);
+    const propsKey = Object.keys(input).find((key) => key.startsWith('__reactProps$'));
+    input[propsKey].onChange({ target: { value } });
+  });
+  const catalog = () => Response.json({ models: [{ id: 'codex-catalog-id', name: 'Friendly display name' }, { id: 'other-codex-id' }] });
+  try {
+    await flush(() => root.render(React.createElement(App)));
+    assert.equal(calls.some((call) => call.path.startsWith('/api/models')), false, 'automatic backend configuration does not fetch a catalog');
+    assert.match(document.body.textContent, /CODEX CLI.*Detected · login required/);
+    assert.equal(document.getElementById('paid-consent').disabled, false, 'CLI readiness does not require an API key');
+    assert.equal(document.getElementById('audit-model'), null, 'Codex does not suggest manual API model IDs');
+    assert.doesNotMatch(document.body.textContent, /Manual IDs|enter a model.*manually/);
+    for (const copy of [/codex login on the backend/, /no inference/, /fresh ephemeral threads/, /built-in tools disabled/, /read-only sandbox, not full OS isolation/, /inherited MCP/, /CLI internal retries may consume usage/, /backend validates support against the model catalog/]) assert.match(document.body.textContent, copy);
+    assert.equal(document.getElementById('reasoning-effort').disabled, false);
+    assert.deepEqual([...document.getElementById('reasoning-effort').options].map((option) => option.value), ['', 'low', 'medium', 'high']);
+    await flush(() => document.getElementById('paid-consent').click());
+    await edit('audit-provider', 'codex');
+    assert.equal(document.getElementById('paid-consent').checked, false);
+    assert.equal(pending.length, 1, 'explicit Codex selection automatically loads the catalog');
+    assert.equal(document.getElementById('codex-model').disabled, true);
+    await edit('audit-provider', 'api');
+    assert.equal(pending[0].signal.aborted, true);
+    await flush(() => pending[0].resolve(catalog()));
+    assert.equal(document.querySelector('#available-models option'), null, 'stale success cannot populate another provider');
+    await edit('audit-provider', 'codex');
+    const staleError = pending[1];
+    await edit('audit-provider', 'api');
+    assert.equal(staleError.signal.aborted, true);
+    await flush(() => staleError.reject(new Error('Authorization: Bearer sk-stale-secret')));
+    assert.doesNotMatch(document.body.textContent, /sk-stale-secret|Could not load Codex/);
+    await edit('audit-provider', 'codex');
+    await flush(() => pending[2].resolve(Response.json({ provider_error_code: 'codex', provider_status: 403, detail: 'Authorization: Bearer sk-secret https://private.example/token' }, { status: 502 })));
+    assert.match(document.body.textContent, /Could not load Codex models.*codex login on the backend/);
+    assert.doesNotMatch(document.body.textContent, /Bearer|sk-secret|private\.example|manually/);
+    await flush(() => button('Load models').click());
+    await flush(() => pending[3].resolve(catalog()));
+    assert.equal(document.querySelector('#codex-model option[value="codex-catalog-id"]').textContent, 'codex-catalog-id');
+    await edit('codex-model', 'codex-catalog-id');
+    await edit('reasoning-effort', 'high');
+    await flush(() => document.getElementById('paid-consent').click());
+    await edit('audit-provider', 'api');
+    assert.equal(document.getElementById('paid-consent').checked, false);
+    assert.equal(document.getElementById('audit-model').value, '');
+    assert.equal(document.getElementById('reasoning-effort').value, '');
+    ready = false;
+    await edit('audit-provider', 'codex');
+    assert.equal(document.getElementById('paid-consent').disabled, true);
+    assert.match(document.body.textContent, /Kiro or Codex CLI/);
+    assert.equal(pending.length, 4, 'unavailable CLI does not load models');
+    ready = true;
+    await flush(() => document.querySelector('[aria-label="Refresh history and configuration"]').click());
+    await flush(() => pending[4].resolve(catalog()));
+    await edit('codex-model', 'codex-catalog-id');
+    await edit('reasoning-effort', 'high');
+    assert.match(document.querySelector('.confirmation').textContent, /Codex usage \(subscription or API billing\)/);
+    await flush(() => document.getElementById('paid-consent').click());
+    assert.equal(button('Start live audit').disabled, false);
+    await flush(() => button('Start live audit').click());
+    const body = JSON.parse(calls.find((call) => call.path === '/api/audits' && call.options.method === 'POST').options.body);
+    assert.equal(body.provider, 'codex');
+    assert.equal(body.model, 'codex-catalog-id');
+    assert.equal(body.reasoning_effort, 'high');
+    assert.equal(body.confirmed_paid, true);
+  } finally {
+    await act(async () => root.unmount());
+    dom.window.close(); globalThis.fetch = originalFetch;
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; }
+  }
+});
+
 test('Kiro CLI enables keyless audits, uses its catalog, and disables unsupported reasoning', async () => {
   const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
   const originalFetch = globalThis.fetch;
@@ -263,12 +356,17 @@ test('GitHub previews are keyless, race-safe, reviewable, and require fresh cons
     await preview();
     assert.equal(pending.length, 1, 'preview needs no model key');
     assert.equal(button('Previewing repository').disabled, true);
-    assert.deepEqual(JSON.parse(pending[0].options.body), { url: 'https://github.com/owner/repo', ref: '', subdirectory: '' });
+    assert.deepEqual(JSON.parse(pending[0].options.body), { url: 'https://github.com/owner/repo', ref: '', subdirectory: '', authenticated: false });
     assert.equal(pending[0].options.headers['X-Lucid-Request'], 'local-ui');
+    await flush(() => document.getElementById('github-auth').click());
+    assert.equal(document.getElementById('github-auth').checked, true);
+    assert.equal(pending[0].options.signal.aborted, true, 'changing authentication cancels a preview');
     await edit('github-ref', 'main');
     assert.equal(pending[0].options.signal.aborted, true);
     await preview();
-    await flush(() => pending[1].resolve(Response.json(snapshot('new-preview'))));
+    assert.equal(JSON.parse(pending[1].options.body).authenticated, true);
+        assert.doesNotMatch(pending[1].options.body, /token/i);
+        await flush(() => pending[1].resolve(Response.json(snapshot('new-preview'))));
     await flush(() => pending[0].resolve(Response.json(snapshot('stale-preview'))));
     assert.ok(document.querySelector('.github-preview'));
     assert.equal(auditPosts().length, 0);
@@ -300,7 +398,13 @@ test('GitHub previews are keyless, race-safe, reviewable, and require fresh cons
     await flush(() => document.querySelector('.scope-file input').click());
     await flush(() => consent().click());
     assert.equal(button('Start live audit').disabled, false);
-    for (const [id, value] of [['github-url', 'https://github.com/owner/other'], ['github-ref', 'v2'], ['github-subdirectory', 'contracts/src']]) {
+    await flush(() => document.getElementById('github-auth').click());
+        assert.equal(consent().checked, false, 'authentication changes clear consent');
+        assert.equal(document.querySelector('.github-preview'), null);
+        await preview();
+        await flush(() => pending.at(-1).resolve(Response.json(snapshot())));
+        await flush(() => consent().click());
+        for (const [id, value] of [['github-url', 'https://github.com/owner/other'], ['github-ref', 'v2'], ['github-subdirectory', 'contracts/src']]) {
       await edit(id, value);
       assert.equal(consent().checked, false, `${id} resets consent`);
       assert.equal(document.querySelector('.github-preview'), null);

@@ -14,7 +14,7 @@ import re
 
 from openai import OpenAI
 
-from . import kiro
+from . import codex, kiro
 
 # Legacy course default. Availability is provider-dependent; prefer an explicit
 # OPENAI_MODEL or a per-audit selection from the provider's current catalog.
@@ -25,26 +25,36 @@ def provider_kind(provider: str | None = None) -> str:
     """Resolve a request override; auto uses the backend's configured default.
 
     Never fall back after a failed paid call. Omitted overrides preserve CLI
-    configuration, while api/kiro override it without changing the environment.
+    configuration, while explicit providers override it without changing the environment.
     """
-    if provider is not None and provider not in ("auto", "api", "kiro"):
-        raise ValueError("Provider must be auto, api, or kiro.")
+    if provider is not None and provider not in ("auto", "api", "kiro", "codex"):
+        raise ValueError("Provider must be auto, api, kiro, or codex.")
     configured = (os.environ.get("LUCID_PROVIDER", "auto").strip().lower()
                   if provider in (None, "auto") else provider)
-    if configured not in ("auto", "api", "kiro"):
-        raise ValueError("LUCID_PROVIDER must be auto, api, or kiro.")
+    if configured not in ("auto", "api", "kiro", "codex"):
+        raise ValueError("LUCID_PROVIDER must be auto, api, kiro, or codex.")
     if configured != "auto":
         return configured
-    return "api" if os.environ.get("OPENAI_API_KEY") or not kiro.executable() else "kiro"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "api"
+    if kiro.executable():
+        return "kiro"
+    return "codex" if codex.executable() else "api"
 
 
 def provider_ready(provider: str | None = None) -> bool:
-    return bool(kiro.executable()) if provider_kind(provider) == "kiro" else bool(os.environ.get("OPENAI_API_KEY"))
+    kind = provider_kind(provider)
+    if kind in ("kiro", "codex"):
+        return bool((kiro if kind == "kiro" else codex).executable())
+    return bool(os.environ.get("OPENAI_API_KEY"))
 
 
 def default_model(provider: str | None = None) -> str:
-    """Kiro defaults are separate so stale Requesty model IDs aren't reused."""
-    if provider_kind(provider) == "kiro":
+    """CLI defaults are separate so stale API model IDs aren't reused."""
+    kind = provider_kind(provider)
+    if kind == "codex":
+        return validate_model(os.environ.get("LUCID_CODEX_MODEL", codex.DEFAULT_MODEL))
+    if kind == "kiro":
         return validate_model(os.environ.get("LUCID_KIRO_MODEL", kiro.DEFAULT_MODEL))
     return validate_model(os.environ.get("OPENAI_MODEL", MODEL))
 
@@ -78,8 +88,9 @@ def _client(*, timeout: float = 600.0) -> OpenAI:
 
 def list_models(provider: str | None = None) -> list[dict[str, str]]:
     """List IDs only, without forwarding provider metadata or invoking inference."""
-    if provider_kind(provider) == "kiro":
-        return kiro.list_models()
+    kind = provider_kind(provider)
+    if kind in ("kiro", "codex"):
+        return (kiro if kind == "kiro" else codex).list_models()
     with _client(timeout=10.0) as client:
         page = client.models.list()
     ids = set()
@@ -105,15 +116,16 @@ def complete(
                    makes parsing far more reliable than free-form text.
         model:     per-call model ID; defaults to OPENAI_MODEL or the course fallback.
         reasoning_effort: optional provider-specific reasoning control.
-        provider: optional auto/api/kiro override; credentials remain backend-only.
+        provider: optional auto/api/kiro/codex override; credentials remain backend-only.
 
     Returns:
         The raw text of the model's reply. Parsing is a separate step so the
         caller can decide what to do with it.
     """
     kind = provider_kind(provider)
-    if kind == "kiro":
-        return kiro.complete(system, user, model=model if model is not None else default_model(kind),
+    if kind in ("kiro", "codex"):
+        transport = kiro if kind == "kiro" else codex
+        return transport.complete(system, user, model=model if model is not None else default_model(kind),
                              json_mode=json_mode, reasoning_effort=reasoning_effort)
     # Build the call arguments. JSON mode tells the API "the reply MUST be a
     # valid JSON object", which removes a whole class of parsing headaches. Not

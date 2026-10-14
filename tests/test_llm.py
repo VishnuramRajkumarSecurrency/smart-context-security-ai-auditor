@@ -27,8 +27,22 @@ class LLMTests(unittest.TestCase):
             self.assertEqual(llm.list_models(), [{"id": "kiro-model"}])
             self.assertEqual(llm.complete("system", "source", json_mode=False), "answer")
             complete.assert_called_once_with("system", "source", model="kiro-default", json_mode=False, reasoning_effort=None)
-        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": ""}), patch("lucid.llm.kiro.executable", return_value=None):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": ""}), patch("lucid.llm.kiro.executable", return_value=None), patch("lucid.llm.codex.executable", return_value=None):
             self.assertFalse(llm.provider_ready())
+
+    def test_codex_auto_selection_and_explicit_dispatch(self):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": "", "OPENAI_MODEL": "stale/api", "LUCID_CODEX_MODEL": "codex-default"}), patch("lucid.llm.kiro.executable", return_value=None), patch("lucid.llm.codex.executable", return_value="/fake/codex"), patch("lucid.llm.codex.list_models", return_value=[{"id": "codex-model"}]), patch("lucid.llm.codex.complete", return_value="answer") as complete, patch("lucid.llm._client") as api:
+            self.assertEqual(llm.provider_kind(), "codex")
+            self.assertTrue(llm.provider_ready())
+            self.assertEqual(llm.default_model(), "codex-default")
+            self.assertEqual(llm.list_models(), [{"id": "codex-model"}])
+            self.assertEqual(llm.complete("system", "source", provider="codex", reasoning_effort="high"), "answer")
+            complete.assert_called_once_with("system", "source", model="codex-default", json_mode=True, reasoning_effort="high")
+            api.assert_not_called()
+            complete.side_effect = RuntimeError("failure")
+            with self.assertRaises(RuntimeError):
+                llm.complete("system", "source", provider="codex")
+            api.assert_not_called()
 
     def test_explicit_provider_overrides_and_invalid_configuration(self):
         with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": "fake", "LUCID_KIRO_MODEL": "kiro-model"}):

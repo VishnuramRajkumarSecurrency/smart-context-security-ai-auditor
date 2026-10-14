@@ -7,6 +7,7 @@ test('model validation accepts provider IDs without requiring list membership', 
   for (const id of ['', undefined, null, 123, 'bad model', 'bad\nmodel', 'bad\u0000model', 'bad\u007fmodel']) assert.ok(validateModel(id));
   assert.deepEqual(modelIds({ models: [{ id: 'z' }, { id: 'a' }, { id: 'a' }] }), ['a', 'z']);
   assert.deepEqual(modelIds({ models: [] }), []);
+  assert.throws(() => modelIds({ models: [{ id: 'bad model' }] }, 'codex'), (error) => /invalid Codex model list/.test(error.message) && !/manually/.test(error.message));
   for (const data of [null, [], { models: null }, { models: [null] }, { models: [{ id: '' }] }, { models: [{ id: 'bad model' }] }]) assert.throws(() => modelIds(data), /invalid model list/);
 });
 test('model requests are bounded, cancellable, and hide provider error details', async () => {
@@ -50,6 +51,10 @@ test('provider-specific model requests preserve error redaction', async () => {
   try {
     globalThis.fetch = async () => Response.json({ detail: 'sk-secret', provider_error_code: 'kiro' }, { status: 502 });
     await assert.rejects(request('/api/models?provider=kiro'), (error) => /kiro-cli login/.test(error.message) && !/sk-secret/.test(error.message));
+    for (const path of ['/api/models', '/api/models?provider=codex', '/api/models?provider=codex&refresh=true']) {
+      globalThis.fetch = async () => Response.json({ detail: 'Authorization: Bearer sk-secret https://private.example/token', provider_status: 403, provider_error_code: 'codex' }, { status: 502 });
+      await assert.rejects(request(path), (error) => /codex login on the backend/.test(error.message) && /No inference was requested/.test(error.message) && !/sk-secret|Bearer|private\.example|Requesty|manually/.test(error.message));
+    }
     globalThis.fetch = async () => Response.json({ detail: 'sk-secret', provider_status: 403 }, { status: 502 });
     await assert.rejects(request('/api/models?provider=api'), (error) => /HTTP 403/.test(error.message) && !/sk-secret/.test(error.message));
   } finally { globalThis.fetch = originalFetch; }

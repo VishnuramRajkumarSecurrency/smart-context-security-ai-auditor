@@ -59,7 +59,7 @@ export default function App() {
   const [confirmed, setConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
-  const [github, setGithub] = useState({ url: '', ref: '', subdirectory: '' });
+  const [github, setGithub] = useState({ url: '', ref: '', subdirectory: '', authenticated: false });
   const [preview, setPreview] = useState(null);
   const [githubPaths, setGithubPaths] = useState([]);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -94,7 +94,7 @@ export default function App() {
     return () => controller.abort();
   }, [refresh, provider]);
   useEffect(() => {
-    if (provider === 'kiro' && config?.provider_kind === 'kiro' && config?.provider_ready) loadModels();
+    if (['kiro', 'codex'].includes(provider) && config?.provider_kind === provider && config?.provider_ready) loadModels();
     return () => { modelsVersion.current++; modelsRequest.current?.abort(); };
   }, [provider, config?.provider_kind, config?.provider_ready]);
   useEffect(() => {
@@ -142,6 +142,9 @@ export default function App() {
   const modelError = validateModel(selectedModel);
   const providerReady = config?.provider_ready ?? config?.key_configured;
   const isKiro = config?.provider_kind === 'kiro';
+  const isCodex = config?.provider_kind === 'codex';
+  const isCli = isKiro || isCodex;
+  const cliName = isCodex ? 'Codex' : 'Kiro';
   const canStart = providerReady === true && confirmed && !modelError && !validationError && !reading && !previewLoading && !submitting;
   function clearPreview() {
     previewVersion.current++;
@@ -193,7 +196,7 @@ export default function App() {
     setModelsLoading(true);
     try {
       const data = await request(provider === 'auto' ? '/api/models' : `/api/models?provider=${provider}`, { signal: controller.signal });
-      if (!controller.signal.aborted && version === modelsVersion.current) setModels(modelIds(data));
+      if (!controller.signal.aborted && version === modelsVersion.current) setModels(modelIds(data, config?.provider_kind));
     } catch (error) {
       if (!controller.signal.aborted && version === modelsVersion.current) setModelsError(error.message);
     } finally {
@@ -203,7 +206,7 @@ export default function App() {
   function reset() {
     if (submitLock.current) return;
     uploadVersion.current++;
-    clearPreview(); setGithub({ url: '', ref: '', subdirectory: '' });
+    clearPreview(); setGithub({ url: '', ref: '', subdirectory: '', authenticated: false });
     clearModelRequest(); setModel(''); setJsonMode(true); setReasoningEffort(null);
     setTarget('bundled'); setMode('context'); setRounds(3); setFiles([]); setFileError('');
     setConfirmed(false); setSubmitError(''); setReading(false);
@@ -266,8 +269,8 @@ export default function App() {
         {configError && <Notice onRetry={retryAll}>{configError}</Notice>}
         {activeJobs.length > 0 && <div className="active-banner"><span className="status-dot pulse" /><span>{activeJobs.length} active audit{activeJobs.length > 1 ? 's' : ''}. Switching views does not cancel a scan.</span><a href={routeHref('audit', activeJobs[0].id)}>View active audit <span aria-hidden="true">↗</span></a></div>}
         {route.type === 'new' ? <>
-          <div className="config-strip"><div><span className="meta-label">MODEL</span><strong>{selectedModel || (config ? 'No model selected' : 'Waiting for backend')}</strong></div><div><span className="meta-label">PROVIDER</span><strong>{config?.provider || '—'}</strong></div><div><span className="meta-label">{isKiro ? 'KIRO CLI' : 'BACKEND KEY'}</span><strong className={providerReady ? 'accent' : 'amber'}>{config ? providerReady ? isKiro ? 'Detected · login required' : 'Configured' : 'Not configured' : 'Unknown'}</strong></div></div>
-          {config && !providerReady && <Notice tone="warning" onRetry={retryAll}>Live audits are locked. Configure a provider key or install and sign in to Kiro CLI on the backend, then refresh. You can still preview public GitHub repositories—no key or paid model calls needed.</Notice>}
+          <div className="config-strip"><div><span className="meta-label">MODEL</span><strong>{selectedModel || (config ? 'No model selected' : 'Waiting for backend')}</strong></div><div><span className="meta-label">PROVIDER</span><strong>{config?.provider || '—'}</strong></div><div><span className="meta-label">{isCli ? `${cliName.toUpperCase()} CLI` : 'BACKEND KEY'}</span><strong className={providerReady ? 'accent' : 'amber'}>{config ? providerReady ? isCli ? 'Detected · login required' : 'Configured' : 'Not configured' : 'Unknown'}</strong></div></div>
+          {config && !providerReady && <Notice tone="warning" onRetry={retryAll}>Live audits are locked. Configure a provider key or install and sign in to Kiro or Codex CLI on the backend, then refresh. You can still preview public GitHub repositories—no key or paid model calls needed.</Notice>}
           <form onSubmit={startAudit} className="audit-form">
             <section className="panel source-panel"><div className="section-heading"><span className="step-number">01</span><div><h2>Select your source</h2><p>Choose the contracts you want to investigate.</p></div><span className="section-tag">SOLIDITY</span></div>
               <fieldset disabled={submitting}><legend className="sr-only">Source selection</legend><div className="segmented-control">{[['bundled', 'Bundled target', 'layers'], ['upload', 'Upload contracts', 'upload'], ['github', 'GitHub repository', 'layers']].map(([value, title, icon]) => <label key={value} className={target === value ? 'active' : ''}><input type="radio" name="target" value={value} checked={target === value} onChange={() => changeSetting(() => { clearPreview(); setTarget(value); })} /><Icon name={icon} size={17} />{title}</label>)}</div></fieldset>
@@ -277,7 +280,8 @@ export default function App() {
                                 <label htmlFor="github-ref">Ref <span className="muted">(optional)</span><input id="github-ref" type="text" value={github.ref} placeholder="Default branch" onChange={(event) => editGithub('ref', event.target.value)} /></label>
                                 <label htmlFor="github-subdirectory">Subdirectory <span className="muted">(optional)</span><input id="github-subdirectory" type="text" value={github.subdirectory} placeholder="contracts/src" onChange={(event) => editGithub('subdirectory', event.target.value)} /></label>
                               </fieldset>
-                              <p id="github-help" className="github-help">Public repositories only. Use the root URL https://github.com/owner/repo, not a file or tree URL. Leave ref empty for the default branch. Preview fetches source over the network; it makes no model calls and needs no provider key. No credentials are requested.</p>
+                              <label className="github-auth" htmlFor="github-auth"><input id="github-auth" type="checkbox" checked={github.authenticated} disabled={submitting} onChange={(event) => editGithub('authenticated', event.target.checked)} /><span>Use backend GitHub token <small>Required for private repositories. Configure LUCID_GITHUB_TOKEN on the backend with read-only access to this repository; never paste it into the URL.</small></span></label>
+                                                            <p id="github-help" className="github-help">Public and private GitHub repositories are supported. Use the root URL https://github.com/owner/repo, not a file or tree URL. Leave ref empty for the default branch. Preview fetches source over the network; it makes no model calls and needs no AI provider key. The GitHub token stays on the backend and is used only when the option above is checked. Auditing sends selected source, including private code, to your AI provider after your consent.</p>
                               <button type="button" className="secondary-button" disabled={submitting || previewLoading || !github.url} onClick={previewRepository}><Icon name="search" size={16} />{previewLoading ? 'Previewing repository…' : 'Preview repository'}</button>
                               {previewLoading && <p role="status" className="github-help">Fetching and pinning Solidity source. This may take up to 60 seconds. Editing any field cancels this preview.</p>}
                               {previewError && <Notice onRetry={previewRepository}>{previewError}</Notice>}
@@ -299,27 +303,28 @@ export default function App() {
               {['loop', 'specialists'].includes(mode) && <div className="rounds-control"><label htmlFor="rounds">{mode === 'specialists' ? 'Audit rounds per lane' : 'Audit rounds'} <small>{mode === 'specialists' ? `${rounds} rounds in each of 6 parallel lanes (${6 * rounds} lane rounds total).` : `One context call, followed by ${rounds} finding rounds.`}</small></label><input id="rounds" type="range" min="1" max="10" step="1" value={rounds} onChange={(event) => changeSetting(() => setRounds(Number(event.target.value)))} /><output htmlFor="rounds">{rounds}</output></div>}</fieldset>
               {mode === 'specialists' && <p className="model-help">Six lanes run concurrently: provider rate limits may cause failures, and more rounds increase cost. The model judge is not human verification.</p>}
             </section>
-            <section className="panel model-panel"><div className="section-heading"><span className="step-number">03</span><div><h2>Choose a model</h2><p>Use the backend default or enter a model ID for this audit.</p></div></div>
+            <section className="panel model-panel"><div className="section-heading"><span className="step-number">03</span><div><h2>Choose a model</h2><p>{isCodex ? 'Use the backend default or select a Codex catalog model for this audit.' : 'Use the backend default or enter a model ID for this audit.'}</p></div></div>
               <fieldset className="model-controls" disabled={submitting}><legend className="sr-only">Model settings</legend>
-                <div className="model-options"><label htmlFor="audit-provider">Model provider<select id="audit-provider" value={provider} onChange={(event) => selectProvider(event.target.value)}><option value="auto">Automatic (backend configuration)</option><option value="api">API / Requesty</option><option value="kiro">Kiro CLI</option></select></label>
-                {isKiro && <label htmlFor="kiro-model">Available Kiro models<select id="kiro-model" value={models.includes(model) ? model : ''} disabled={modelsLoading || !models.length} onChange={(event) => changeSetting(() => setModel(event.target.value))}><option value="">{modelsLoading ? 'Loading Kiro models…' : 'Kiro default model'}</option>{models.map((id) => <option key={id} value={id}>{id}</option>)}</select></label>}</div>
-                <div className="model-picker"><label htmlFor="audit-model"><span>Model ID <span className="muted">(blank uses backend default)</span></span><input id="audit-model" type="text" list="available-models" value={model} placeholder={config?.model || 'Backend default'} aria-describedby="model-help" aria-invalid={!!modelError} onChange={(event) => changeSetting(() => setModel(event.target.value))} /></label><button type="button" className="secondary-button" disabled={submitting || modelsLoading} onClick={loadModels}><Icon name="search" size={16} />{modelsLoading ? 'Loading models…' : 'Load models'}</button></div>
+                <div className="model-options"><label htmlFor="audit-provider">Model provider<select id="audit-provider" value={provider} onChange={(event) => selectProvider(event.target.value)}><option value="auto">Automatic (backend configuration)</option><option value="api">API / Requesty</option><option value="kiro">Kiro CLI</option><option value="codex">Codex CLI</option></select></label>
+                {isCli && <label htmlFor={`${config.provider_kind}-model`}>Available {cliName} models<select id={`${config.provider_kind}-model`} value={models.includes(model) ? model : ''} disabled={modelsLoading || !models.length} onChange={(event) => changeSetting(() => setModel(event.target.value))}><option value="">{modelsLoading ? `Loading ${cliName} models…` : `${cliName} default model`}</option>{models.map((id) => <option key={id} value={id}>{id}</option>)}</select></label>}</div>
+                <div className="model-picker">{!isCodex && <label htmlFor="audit-model"><span>Model ID <span className="muted">(blank uses backend default)</span></span><input id="audit-model" type="text" list="available-models" value={model} placeholder={config?.model || 'Backend default'} aria-describedby="model-help" aria-invalid={!!modelError} onChange={(event) => changeSetting(() => setModel(event.target.value))} /></label>}<button type="button" className="secondary-button" disabled={submitting || modelsLoading} onClick={loadModels}><Icon name="search" size={16} />{modelsLoading ? 'Loading models…' : 'Load models'}</button></div>
                 <datalist id="available-models">{models.map((id) => <option key={id} value={id} />)}</datalist>
                 <div className="model-options"><label htmlFor="json-mode">JSON mode<select id="json-mode" value={String(jsonMode)} onChange={(event) => changeSetting(() => setJsonMode(event.target.value === 'true'))}><option value="true">Enabled (default)</option><option value="false">Disabled</option></select></label><label htmlFor="reasoning-effort">Reasoning effort<select id="reasoning-effort" disabled={isKiro} value={reasoningEffort || ''} onChange={(event) => changeSetting(() => setReasoningEffort(event.target.value || null))}><option value="">Provider default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label></div>
               </fieldset>
               {isKiro && <p className="model-help">Using Kiro CLI via ACP. Selecting Kiro loads available models automatically; the reload button can refresh them. Run kiro-cli login on the backend, then Load models to verify access. Kiro subscription credits apply. JSON mode is a prompt instruction; reasoning effort overrides are unsupported. Audits use a no-tools agent profile, not an OS sandbox; Kiro may save prompts in its session history.</p>}
-              <p id="model-help" className="model-help">API model lists are fetched only when you click Load models; choosing Kiro loads its catalog automatically. The backend may contact your provider. Manual IDs work without loading the list. All context, finding rounds, and any specialist judge use the same selected model. JSON mode is optional; finding responses are still parsed and validated regardless.</p>
+              {isCodex && <p className="model-help">Using Codex CLI. Run codex login on the backend, then Load models to verify access. Configuration and model listing request no inference. Audits use fresh ephemeral threads with built-in tools disabled and a read-only sandbox, not full OS isolation; inherited MCP servers and CLI configuration may still apply. JSON mode is a prompt instruction. Codex supports low, medium, or high reasoning effort; the backend validates support against the model catalog. CLI internal retries may consume usage.</p>}
+              <p id="model-help" className="model-help">{isCodex ? 'Selecting Codex loads its catalog automatically; Load models refreshes it. Choose a catalog model ID or use the backend default. Model listing requests no inference.' : 'API model lists are fetched only when you click Load models; choosing Kiro loads its catalog automatically. The backend may contact your provider. Manual IDs work without loading the list.'} All context, finding rounds, and any specialist judge use the same selected model. JSON mode is optional; finding responses are still parsed and validated regardless.</p>
               <p className="model-help">Capabilities, JSON/reasoning support, pricing, and context limits vary by model and provider. No automatic paid compatibility retries are requested by this UI.</p>
-              {modelsLoading && <p role="status" className="model-help">Loading provider model IDs… You can still enter a model manually.</p>}
-              {!modelsLoading && models.length > 0 && <p role="status" className="model-help">{models.length} model IDs available. Type to search suggestions.</p>}
+              {modelsLoading && <p role="status" className="model-help">Loading provider model IDs… {isCodex ? 'Wait for the Codex catalog or use the backend default.' : 'You can still enter a model manually.'}</p>}
+              {!modelsLoading && models.length > 0 && <p role="status" className="model-help">{models.length} model IDs available. {isCodex ? 'Select a Codex model above.' : 'Type to search suggestions.'}</p>}
               {modelsError && <Notice>{modelsError}</Notice>}
-              {modelError && <Notice>{modelError}</Notice>}
+              {modelError && <Notice>{isCodex ? 'Select a valid Codex catalog model or configure a valid backend default.' : modelError}</Notice>}
             </section>
             <section className="panel launch-panel"><div className="section-heading"><span className="step-number">04</span><div><h2>Review & launch</h2><p>You’re always in control of paid model calls.</p></div></div><div className="cost-notice"><Icon name="clock" size={22} /><div><strong>{mode === 'specialists' ? `Up to ${calls} paid model calls` : `${calls} paid model call${calls === 1 ? '' : 's'} planned`}</strong><p>{mode === 'single' ? 'One vulnerability scan.' : mode === 'context' ? 'One protocol-context call + one vulnerability scan.' : mode === 'specialists' ? `One protocol-context call + 6 parallel lanes × ${rounds} rounds per lane + up to 1 AI judge call (skipped if there are no candidates).` : `One protocol-context call + ${rounds} vulnerability scans.`} Provider usage charges apply; retries may add calls. This is not a price estimate.</p></div></div>
-              <label className="confirmation"><input type="checkbox" checked={confirmed} id="paid-consent" disabled={submitting || !providerReady || !!modelError || (target === 'github' && (!preview || previewLoading || !!validationError))} onChange={(event) => setConfirmed(event.target.checked)} /><span>{isKiro ? 'I authorize this live audit and its Kiro subscription usage.' : 'I authorize this live audit and its paid API usage.'}<small>Selected source and generated context will be sent by the backend to {config?.provider || 'the configured AI provider'} using model {selectedModel || '—'}. Credentials stay on the backend.</small></span></label>
+              <label className="confirmation"><input type="checkbox" checked={confirmed} id="paid-consent" disabled={submitting || !providerReady || !!modelError || (target === 'github' && (!preview || previewLoading || !!validationError))} onChange={(event) => setConfirmed(event.target.checked)} /><span>{isCodex ? 'I authorize this live audit and its Codex usage (subscription or API billing).' : isKiro ? 'I authorize this live audit and its Kiro subscription usage.' : 'I authorize this live audit and its paid API usage.'}<small>Selected source and generated context will be sent by the backend to {config?.provider || 'the configured AI provider'} using model {selectedModel || '—'}. Credentials stay on the backend.</small></span></label>
               {submitError && <Notice>{submitError}</Notice>}
               <div className="launch-footer"><span><Icon name="shield" size={16} />AI findings require human verification.</span><button type="submit" className="primary-button" disabled={!canStart}>{submitting ? 'Starting audit…' : 'Start live audit'}<Icon name="arrow" size={18} /></button></div>
-              {!canStart && !submitting && <p className="launch-help">{!config ? 'Connect to the backend to enable live audits.' : !providerReady ? 'Configure a backend provider key or install and sign in to Kiro CLI for live audits.' : reading ? 'Wait for the source files to finish loading.' : modelError || validationError || 'Confirm paid API usage above to start.'}</p>}
+              {!canStart && !submitting && <p className="launch-help">{!config ? 'Connect to the backend to enable live audits.' : !providerReady ? 'Configure a backend provider key or install and sign in to Kiro or Codex CLI for live audits.' : reading ? 'Wait for the source files to finish loading.' : (modelError ? isCodex ? 'Select a valid Codex catalog model or configure a valid backend default.' : modelError : null) || validationError || (isCodex ? 'Confirm Codex usage (subscription or API billing) above to start.' : 'Confirm paid API usage above to start.')}</p>}
             </section>
           </form>
         </> : <>

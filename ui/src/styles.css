@@ -117,6 +117,9 @@ h3 { font-size: 13px; font-weight: 600; }
 .github-fields .github-url { grid-column: 1 / -1; }
 .github-fields input { width: 100%; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 4px; background: #1b1d20; font-size: 12px; }
 .github-fields input::placeholder { color: var(--muted); }
+.github-auth { display: flex; align-items: flex-start; gap: 12px; margin-top: 20px; font-size: 12px; line-height: 1.7; }
+.github-auth input { flex: 0 0 auto; margin: 3px 0 0; accent-color: var(--accent); }
+.github-auth small { display: block; color: var(--muted); font-size: 11px; }
 .github-help { color: var(--muted); font-size: 11px; line-height: 1.8; margin: 16px 0; }
 .github-preview { margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--border); }
 .repository-meta { gap: 18px; }

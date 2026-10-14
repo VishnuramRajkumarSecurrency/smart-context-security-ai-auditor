@@ -1,6 +1,7 @@
-"""Bounded, anonymous previews of public GitHub Solidity repositories."""
+"""Bounded GitHub Solidity previews with opt-in private repository access."""
 
 import json
+import os
 import re
 import time
 import unicodedata
@@ -81,11 +82,13 @@ def _download(
         if status == 429 or (status == 403 and (
             response.headers.get("x-ratelimit-remaining") == "0" or "retry-after" in response.headers
         )):
-            raise GitHubSourceError("GitHub's anonymous rate limit was reached. Wait and retry later; tokens are not supported.")
-        if status in (401, 404):
-            raise GitHubSourceError("Repository, ref, or source was not found. Check the URL and ref; only public repositories are supported.")
+            raise GitHubSourceError("GitHub's rate limit was reached. Wait and retry later; authenticated requests can also be rate limited.")
+        if status == 401:
+            raise GitHubSourceError("GitHub authentication failed. Check the token used for authenticated access.")
+        if status == 404:
+            raise GitHubSourceError("Repository, ref, or source was not found. Check the URL and ref, and the token's repository access for private repositories.")
         if status == 403:
-            raise GitHubSourceError("GitHub denied this request (access restriction or rate limit). Use a public repository or retry later.")
+            raise GitHubSourceError("GitHub denied this request. Check token permissions and organization SSO restrictions.")
         if 300 <= status < 400:
             raise GitHubSourceError("GitHub returned a redirect. Use the repository's current canonical URL; redirects are not followed.")
         if status != 200:
@@ -130,14 +133,17 @@ def _json(client: httpx.Client, url: str, limit: int, deadline: float, label: st
     return data
 
 
-def fetch_repository(url: str, ref: str = "", subdirectory: str = "") -> dict:
+def fetch_repository(url: str, ref: str = "", subdirectory: str = "", *, authenticated: bool = False) -> dict:
     """Fetch regular .sol files at one pinned commit, keeping repo-root paths.
 
     Uses GET /repos/{owner}/{repo} (only for a default ref),
     GET /repos/{owner}/{repo}/commits/{ref} with Accept: application/vnd.github.sha, and
     GET /repos/{owner}/{repo}/git/trees/{commit}?recursive=1 on api.github.com,
-    then GET /{owner}/{repo}/{commit}/{path} on raw.githubusercontent.com.
-    Nothing is written to disk or executed. No credentials or redirects are used.
+    then GET /{owner}/{repo}/{commit}/{path} on raw.githubusercontent.com anonymously.
+    With authenticated=True, only LUCID_GITHUB_TOKEN is read and sent as a Bearer
+    token to api.github.com; sources use GET /repos/{owner}/{repo}/contents/{path}
+    with ref={commit} and Accept: application/vnd.github.raw+json instead.
+    Nothing is written to disk or executed. Redirects are never followed.
     The 60-second elapsed budget is checked between operations, with per-request
     inactivity timeouts capped at 10 seconds or the remaining budget. This is
     not a hard wall-clock deadline: trickling headers or other blocking HTTP
@@ -149,18 +155,27 @@ def fetch_repository(url: str, ref: str = "", subdirectory: str = "") -> dict:
         raise GitHubSourceError("The ref must be a branch, tag, or commit string.")
     if ref:
         ref = _ref(ref)
+    headers = {"User-Agent": "lucid-public-repository-preview", "Accept": "application/vnd.github+json", "Accept-Encoding": "identity"}
+    if authenticated:
+        token = os.environ.get("LUCID_GITHUB_TOKEN")
+        if not isinstance(token, str) or not re.fullmatch(r"[!-~]{1,4096}", token):
+            raise GitHubSourceError("Authenticated GitHub access requires a valid LUCID_GITHUB_TOKEN (1–4096 printable ASCII characters without whitespace).")
+        headers["Authorization"] = f"Bearer {token}"
     deadline = time.monotonic() + TOTAL_TIMEOUT
     api = f"https://api.github.com/repos/{repository}"
     try:
         # trust_env=False also prevents environment proxies and netrc credentials.
         with httpx.Client(
             follow_redirects=False, trust_env=False, timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "lucid-public-repository-preview", "Accept": "application/vnd.github+json", "Accept-Encoding": "identity"},
+            headers=headers,
         ) as client:
             if not ref:
                 metadata = _json(client, api, 64_000, deadline, "Repository metadata")
-                if metadata.get("private") is not False:
-                    raise GitHubSourceError("Only public GitHub repositories are supported.")
+                private = metadata.get("private")
+                if type(private) is not bool:
+                    raise GitHubSourceError("GitHub returned an invalid repository visibility. Retry later.")
+                if private and not authenticated:
+                    raise GitHubSourceError("Only public GitHub repositories are supported without authenticated access.")
                 ref = _ref(metadata.get("default_branch"))
             commit_bytes = _download(
                 client, f"{api}/commits/{quote(ref, safe='')}", 128, deadline, "Commit SHA response",
@@ -207,8 +222,13 @@ def fetch_repository(url: str, ref: str = "", subdirectory: str = "") -> dict:
                 raise GitHubSourceError("Selected Solidity sources exceed the 1,600,000-byte total limit. Choose a smaller subdirectory.")
             files, total_bytes = [], 0
             for path in sorted(selected):
-                raw_url = f"https://raw.githubusercontent.com/{repository}/{commit}/{quote(path, safe='/')}"
-                content = _download(client, raw_url, min(MAX_FILE_BYTES, MAX_SOURCE_BYTES - total_bytes), deadline, "Solidity source")
+                if authenticated:
+                    source_url = f"{api}/contents/{quote(path, safe='/')}?ref={commit}"
+                    accept = "application/vnd.github.raw+json"
+                else:
+                    source_url = f"https://raw.githubusercontent.com/{repository}/{commit}/{quote(path, safe='/')}"
+                    accept = "application/vnd.github+json"
+                content = _download(client, source_url, min(MAX_FILE_BYTES, MAX_SOURCE_BYTES - total_bytes), deadline, "Solidity source", accept=accept)
                 total_bytes += len(content)
                 if len(content) != selected[path]:
                     raise GitHubSourceError("Source size does not match the pinned tree. Retry later; partial previews are not allowed.")
