@@ -106,6 +106,8 @@ for line in sys.stdin.buffer:
         else:
             reply(request, {})
     elif method == "session/prompt":
+        assert "content" not in request["params"]
+        assert isinstance(request["params"]["prompt"], list)
         if scenario == "permissions":
             for i, name in enumerate(["session/request_permission", "fs/read_text_file",
                                       "fs/write_text_file", "terminal/create", "terminal/output",
@@ -245,9 +247,10 @@ class KiroTests(unittest.TestCase):
         self.assertEqual(requests[2]["params"], {"sessionId": "test-session", "modelId": "z/selected"})
         prompt = requests[3]["params"]
         self.assertEqual(prompt["sessionId"], "test-session")
-        self.assertEqual(prompt["content"][1], {"type": "text", "text": source})
-        self.assertIn("SYSTEM", prompt["content"][0]["text"])
-        self.assertIn("valid JSON object", prompt["content"][0]["text"])
+        self.assertNotIn("content", prompt)
+        self.assertEqual(prompt["prompt"][1], {"type": "text", "text": source})
+        self.assertIn("SYSTEM", prompt["prompt"][0]["text"])
+        self.assertIn("valid JSON object", prompt["prompt"][0]["text"])
         record = self.records()[0]
         for key, value in {"tools": [], "allowedTools": [], "resources": [], "hooks": {}, "mcpServers": {}}.items():
             self.assertEqual(record["agent"][key], value)
@@ -275,7 +278,7 @@ class KiroTests(unittest.TestCase):
         self.assertFalse(any(r["method"] == "session/set_model" for r in self.requests()))
         prompts = [r for r in self.requests() if r["method"] == "session/prompt"]
         self.assertEqual(len(prompts), 3)
-        self.assertEqual(prompts[0]["params"]["content"][0]["text"], "Instructions:\nS")
+        self.assertEqual(prompts[0]["params"]["prompt"][0]["text"], "Instructions:\nS")
         self.assertEqual(len({p.pid for p in self.processes}), 3)
         self.assert_clean()
 

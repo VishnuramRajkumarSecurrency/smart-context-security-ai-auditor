@@ -18,9 +18,10 @@ agent commands, not the server or MCP processes. 0.162.1 app-server has no
 --ignore-user-config (exec only), and its schema lacks restricted read roots.
 HOME/CODEX_HOME must remain available for local auth: global instructions,
 config, execpolicy, and managed requirements can still apply. Empty TOML maps
-merge, so mcp_servers={} does NOT erase configured MCP servers. The orchestrator
-MCP gate only disables orchestrator-owned tools. User MCP startup may therefore
-occur before an event can be rejected; do not use this adapter with untrusted
+merge, so mcp_servers={} does NOT erase configured MCP servers. Before thread
+creation, config/read discovers inherited server names and thread-local overrides
+explicitly disable each one. Managed overrides or configuration changes can still
+cause startup before an event can be rejected; do not use this adapter with untrusted
 Codex configuration. Use an externally sandboxed account for stronger isolation.
 Ephemeral threads avoid rollouts, but CLI auth refresh/cache/log writes may
 still occur. No source prompts are placed in argv or adapter-created files.
@@ -41,7 +42,7 @@ from pathlib import Path
 
 DEFAULT_MODEL = "codex-default"
 _CATALOG_TIMEOUT = 15.0
-_COMPLETION_TIMEOUT = 600.0
+_COMPLETION_TIMEOUT = 1200.0
 _CLEANUP_TIMEOUT = 1.0
 _MAX_INPUT = 8 * 1024 * 1024
 _MAX_OUTPUT = 16 * 1024 * 1024
@@ -364,6 +365,27 @@ class _Connection:
             cursors.add(cursor)
         raise CodexError("Codex model pagination exceeded the safety limit.")
 
+    def text_only_config(self, cwd):
+        # Query the effective config for the same empty cwd before thread/start:
+        # an empty MCP map merges with inherited entries instead of removing them.
+        # Never forward server definitions (which may contain credentials), write
+        # configuration, or request layers containing unrelated file contents.
+        result = self.rpc("config/read", {"includeLayers": False, "cwd": cwd})
+        config = result.get("config")
+        if not isinstance(config, dict):
+            raise CodexError("Codex returned invalid configuration while disabling inherited MCP servers.")
+        servers = config.get("mcp_servers", {})
+        if (not isinstance(servers, dict) or len(servers) > 512
+                or any(not isinstance(name, str) or not name or len(name) > 256
+                       or any(ord(c) < 32 or ord(c) == 127 for c in name)
+                       or not isinstance(value, dict) for name, value in servers.items())):
+            raise CodexError("Codex returned invalid MCP configuration; no audit thread was started.")
+        overrides = dict(_CONFIG)
+        if servers:
+            # A nested object preserves literal names containing dots or quotes.
+            overrides["mcp_servers"] = {name: {"enabled": False} for name in servers}
+        return overrides
+
     def answer(self, thread_id, turn_id):
         answers = {}
         while True:
@@ -513,11 +535,12 @@ def complete(system: str, user: str, model: str | None = None,
                     or not all(isinstance(option, dict) for option in supported)
                     or reasoning_effort not in [option.get("reasoningEffort") for option in supported]):
                 raise CodexError("The selected Codex model does not advertise support for that reasoning effort.")
+        thread_config = connection.text_only_config(cwd)
         result = connection.rpc("thread/start", {
             "model": selected, "modelProvider": "openai", "ephemeral": True,
             "cwd": cwd, "approvalPolicy": "never", "approvalsReviewer": "user",
             "sandbox": "read-only", "developerInstructions": instructions,
-            "config": _CONFIG,
+            "config": thread_config,
         })
         thread = result.get("thread", {})
         thread_id = _identifier(thread.get("id"))

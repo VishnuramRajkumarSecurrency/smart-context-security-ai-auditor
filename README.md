@@ -267,9 +267,16 @@ warnings and configuration-fallback warnings still stop the operation. A
 successful final turn is required even after an informational notice.
 **This is not full OS/config isolation.**
 The CLI retains access to its normal auth/config location. Version 0.162.1
-app-server cannot ignore user config or restrict all read roots; inherited MCP
-servers can start before Lucid rejects events. Use only trusted Codex
-configuration, review existing MCP settings, and use an external sandbox/account
+app-server cannot ignore user config or restrict all read roots. Before creating
+an audit thread, Lucid queries the effective configuration (without config layers)
+and disables each inherited MCP server using thread-local `enabled=false`
+overrides. It does not edit your normal Codex configuration or forward server
+commands, URLs, or credentials into the thread overrides. If discovery fails or
+MCP activity still occurs (for example, because managed policy overrides the
+restriction), the audit stops; no tool permissions are granted. Configuration
+changes between discovery and thread creation can still allow startup before
+Lucid rejects an event. Use only trusted Codex configuration, review existing MCP
+settings, and use an external sandbox/account
 if stronger isolation is needed. Ephemeral threads avoid persisted rollouts,
 but CLI auth refreshes, caches, and logs may still be written. Provider/GitHub
 credential environment variables are not forwarded to Codex. The adapter

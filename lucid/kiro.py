@@ -386,7 +386,7 @@ def complete(
         connection.collecting = True
         result = connection.rpc("session/prompt", {
             "sessionId": connection.session_id,
-            "content": [{"type": "text", "text": instructions}, {"type": "text", "text": user}],
+            "prompt": [{"type": "text", "text": instructions}, {"type": "text", "text": user}],
         })
         if result.get("stopReason") != "end_turn":
             raise KiroError("Kiro did not complete the response (refused, cancelled, or truncated).")

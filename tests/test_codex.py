@@ -102,6 +102,22 @@ for line in sys.stdin.buffer:
         if scenario == "missing-efforts":
             for row in data: row.pop("supportedReasoningEfforts")
         reply(request, {"data": data, "nextCursor": next_cursor})
+    elif method == "config/read":
+        config = {"mcp_servers": {}}
+        if scenario in ("inherited-mcp", "inherited-mcp-ignored"):
+            config["mcp_servers"] = {
+                'server.with.dots"quoted': {"command": "SECRET", "env": {"TOKEN": "SECRET"}},
+                "already-disabled": {"enabled": False, "url": "SECRET"}}
+        if scenario == "bad-mcp-config": config["mcp_servers"] = ["SECRET"]
+        if scenario == "bad-mcp-entry": config["mcp_servers"] = {"SECRET": "SECRET"}
+        if scenario == "bad-mcp-name": config["mcp_servers"] = {"bad\nSECRET": {}}
+        if scenario == "many-mcp-servers": config["mcp_servers"] = {str(i): {} for i in range(513)}
+        if scenario == "missing-config":
+            reply(request, {})
+        elif scenario == "config-read-error":
+            send({"id": request["id"], "error": {"message": "SECRET"}})
+        else:
+            reply(request, {"config": config})
     elif method == "thread/start":
         p = request["params"]
         result = {"thread": {"id": "thread", "ephemeral": True}, "model": p["model"],
@@ -117,7 +133,9 @@ for line in sys.stdin.buffer:
         if scenario == "unsafe-cwd": result["cwd"] = "/other"
         if scenario == "persistent": result["thread"]["ephemeral"] = False
         if scenario == "instructions": result["instructionSources"] = ["SECRET"]
-        if scenario == "mcp-startup": event("mcpServer/startupStatus/updated", threadId="thread", name="SECRET")
+        if scenario in ("inherited-mcp", "inherited-mcp-ignored"):
+            assert p["config"]["mcp_servers"] == {'server.with.dots"quoted': {"enabled": False}, "already-disabled": {"enabled": False}}
+        if scenario in ("mcp-startup", "inherited-mcp-ignored"): event("mcpServer/startupStatus/updated", threadId="thread", name="SECRET")
         if scenario == "warning": event("configWarning", summary="SECRET")
         if scenario == "skill-advisory":
             event("warning", message="Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /isolated/config.toml.")
@@ -398,6 +416,34 @@ class CodexTests(unittest.TestCase):
         with self.assertRaises(codex.CodexError):
             connection._notification({"method": "configWarning", "params": {"summary": harmless}})
 
+    def test_inherited_mcp_disabled_before_thread_without_copying_secrets(self):
+        with self.fixture("inherited-mcp"):
+            self.assertEqual(codex.complete("s", "u"), '{"answer":"héllo"}')
+        requests = self.requests()
+        config_read = next(r for r in requests if r["method"] == "config/read")
+        thread = next(r for r in requests if r["method"] == "thread/start")
+        self.assertEqual(config_read["params"], {"includeLayers": False, "cwd": thread["params"]["cwd"]})
+        self.assertLess(requests.index(config_read), requests.index(thread))
+        self.assertEqual(thread["params"]["config"]["mcp_servers"], {
+            'server.with.dots"quoted': {"enabled": False}, "already-disabled": {"enabled": False}})
+        self.assertNotIn("SECRET", json.dumps(requests))
+        self.assertNotIn("mcp_servers", codex._CONFIG)
+        self.assertFalse(any(r["method"].startswith("config/") and r["method"] != "config/read" for r in requests))
+        self.assert_clean()
+
+    def test_invalid_mcp_discovery_or_ignored_override_fails_before_turn(self):
+        for scenario in ("bad-mcp-config", "bad-mcp-entry", "bad-mcp-name", "many-mcp-servers",
+                         "missing-config", "config-read-error", "inherited-mcp-ignored"):
+            before = len(self.requests()) if self.log.exists() else 0
+            with self.subTest(scenario=scenario), self.fixture(scenario), self.assertRaises(codex.CodexError) as raised:
+                codex.complete("s", "u")
+            self.assertNotIn("SECRET", str(raised.exception))
+            new_requests = self.requests()[before:]
+            self.assertFalse(any(r["method"] == "turn/start" for r in new_requests))
+            if scenario != "inherited-mcp-ignored":
+                self.assertFalse(any(r["method"] == "thread/start" for r in new_requests))
+        self.assert_clean()
+
     def test_automatic_compaction_is_not_a_tool_or_final_answer(self):
         with self.fixture("compaction"):
             self.assertEqual(codex.complete("s", "u"), '{"answer":"héllo"}')
@@ -457,7 +503,7 @@ class CodexTests(unittest.TestCase):
         with self.fixture("retry-success"):
             self.assertEqual(codex.complete("s", "u"), '{"answer":"héllo"}')
         self.assertEqual([r["method"] for r in self.requests()],
-                         ["initialize", "initialized", "model/list", "model/list", "thread/start", "turn/start"])
+                         ["initialize", "initialized", "model/list", "model/list", "config/read", "thread/start", "turn/start"])
         self.assert_clean()
 
     def test_internal_retry_still_requires_terminal_success(self):
