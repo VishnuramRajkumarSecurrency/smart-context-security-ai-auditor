@@ -31,6 +31,7 @@ right tool for that — real parallelism for I/O waits, no asyncio required.
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from . import llm
 from .agent import find_bugs_loop
 from .schema import Finding
 from .specialists import SPECIALISTS, run_specialist_loop
@@ -73,15 +74,10 @@ def run_specialists_parallel(
     """
     findings_by_specialist: dict[str, list[Finding]] = {}
 
-    # One worker per lane — five specialists plus the general hunter, six
-    # long-lived threads (each now runs `rounds` sequential calls, not one),
-    # not a pool sized for reuse. Submitting the general hunter into this
-    # SAME executor (rather than calling it before or after) is what keeps
-    # the specialists' extra coverage from costing extra wall-clock time -
-    # total fan-out time is bounded by the slowest lane's `rounds` calls, not
-    # the sum of all six lanes' calls.
+    # CLI providers can queue lanes to stay within subscription concurrency
+    # limits; every lane still runs its own rounds sequentially.
     total_lanes = len(SPECIALISTS) + 1
-    with ThreadPoolExecutor(max_workers=total_lanes) as executor:
+    with ThreadPoolExecutor(max_workers=llm.lane_workers(total_lanes)) as executor:
         future_to_key = {
             executor.submit(run_specialist_loop, codebase, context, specialist["key"], rounds): specialist["key"]
             for specialist in SPECIALISTS

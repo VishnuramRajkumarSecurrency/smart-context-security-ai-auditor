@@ -241,6 +241,11 @@ class AuditStore:
     def start(self, request: AuditRequest, codebase: str, source: dict | None = None) -> dict:
         provider = llm.provider_kind(request.provider)
         model = request.model if request.model is not None else llm.default_model(provider)
+        if request.mode == "specialists":
+            try:
+                llm.lane_workers(len(SPECIALIST_LANES), provider)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from None
         if provider in ("kiro", "codex"):
             if provider == "kiro" and request.reasoning_effort is not None:
                 raise HTTPException(400, "Kiro ACP does not support the reasoning effort option. Use provider default; no audit prompt was sent.")
@@ -353,8 +358,9 @@ class AuditStore:
                 error = str(exc) if isinstance(exc, AuditOutputError) else provider_error(exc)
                 self.update_lane(job_id, key, status="failed", error=error)
 
-        self.update(job_id, stage="Auditing · six parallel lanes")
-        with ThreadPoolExecutor(max_workers=len(SPECIALIST_LANES), thread_name_prefix="lucid-lane") as executor:
+        workers = llm.lane_workers(len(SPECIALIST_LANES), provider)
+        self.update(job_id, stage=f"Auditing · six lanes · up to {workers} concurrent")
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lucid-lane") as executor:
             futures = [executor.submit(run_lane, lane["key"]) for lane in SPECIALIST_LANES]
             for future in futures:
                 future.result()

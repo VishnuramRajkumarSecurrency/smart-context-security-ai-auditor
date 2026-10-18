@@ -259,6 +259,23 @@ model's advertised capabilities before inference. Lucid starts no inference
 retries, but Codex's internal retries may consume additional usage. Specialist
 mode launches concurrent CLI processes and can hit account concurrency limits.
 
+For both **Kiro and Codex**, `CLI_MAX_CONCURRENT_LANES` limits active specialist
+lanes per audit in the dashboard and terminal runner. The default is **2**;
+valid values are **1–6**. All six lanes still run, with excess lanes queued, and
+each lane's rounds remain sequential. API/Requesty keeps six concurrent lanes.
+This controls concurrency, not the total model-call count or subscription usage;
+separate Lucid processes have separate limits. For example, before starting Lucid:
+
+```sh
+export CLI_MAX_CONCURRENT_LANES=1
+python -m lucid.web
+```
+
+Use `6` to restore full CLI fan-out. Invalid values reject dashboard specialist
+audits before inference and terminal specialist runs before lane execution (the
+terminal runner may already have built context). Restart the backend after
+changing its environment.
+
 Built-in tools/features are disabled where supported; the agent sandbox is
 read-only with network disabled, approval requests are never granted, and
 observed tool activity is rejected. Known 0.162.1 informational notices caused

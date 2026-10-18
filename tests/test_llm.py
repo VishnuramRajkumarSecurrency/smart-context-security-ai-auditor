@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from lucid import context, llm
+from lucid import context, llm, orchestrator
 
 
 class LLMTests(unittest.TestCase):
@@ -13,6 +13,41 @@ class LLMTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {"LUCID_PROVIDER": "api"})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+
+    def test_cli_lane_limit_defaults_overrides_and_api_is_unchanged(self):
+        with patch.dict(os.environ):
+            os.environ.pop("CLI_MAX_CONCURRENT_LANES", None)
+            for provider in ("kiro", "codex"):
+                self.assertEqual(llm.lane_workers(6, provider), 2)
+            for value in ("1", "2", "6", " 3 "):
+                os.environ["CLI_MAX_CONCURRENT_LANES"] = value
+                for provider in ("kiro", "codex"):
+                    self.assertEqual(llm.lane_workers(6, provider), int(value))
+                    self.assertEqual(llm.lane_workers(1, provider), 1)
+                self.assertEqual(llm.lane_workers(6, "api"), 6)
+            for value in ("", "0", "7", "-1", "1.5", "two", "²"):
+                os.environ["CLI_MAX_CONCURRENT_LANES"] = value
+                for provider in ("kiro", "codex"):
+                    with self.subTest(value=value, provider=provider), self.assertRaisesRegex(ValueError, "CLI_MAX_CONCURRENT_LANES"):
+                        llm.lane_workers(6, provider)
+                self.assertEqual(llm.lane_workers(6, "api"), 6)
+            os.environ.update(LUCID_PROVIDER="codex", CLI_MAX_CONCURRENT_LANES="1")
+            self.assertEqual(llm.lane_workers(6), 1)
+
+    def test_terminal_specialists_use_cli_lane_limit(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        for provider in ("kiro", "codex"):
+            with self.subTest(provider=provider), patch.dict(os.environ, {
+                "LUCID_PROVIDER": provider, "CLI_MAX_CONCURRENT_LANES": "1",
+            }), patch("lucid.orchestrator.ThreadPoolExecutor", wraps=ThreadPoolExecutor) as executor, patch(
+                "lucid.orchestrator.run_specialist_loop", return_value=[],
+            ) as specialist, patch("lucid.orchestrator.find_bugs_loop", return_value=[]) as general, patch("builtins.print"):
+                findings = orchestrator.run_specialists_parallel("source", "context", rounds=1)
+                executor.assert_called_once_with(max_workers=1)
+                self.assertEqual(specialist.call_count, 5)
+                general.assert_called_once()
+                self.assertEqual(len(findings), 6)
 
     def test_auto_provider_prefers_key_then_kiro_and_never_falls_back_on_failure(self):
         with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": "fake"}), patch("lucid.llm.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.llm._client", side_effect=RuntimeError("provider failed")), patch("lucid.llm.kiro.complete") as fallback:

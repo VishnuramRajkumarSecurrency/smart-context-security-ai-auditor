@@ -54,6 +54,42 @@ class SpecialistStoreTests(unittest.TestCase):
             time.sleep(0.005)
         self.fail("Mock specialist audit did not reach the expected state")
 
+    def test_cli_providers_limit_workers_and_run_all_lanes(self):
+        for provider in ("kiro", "codex"):
+            active, peak, calls = 0, 0, 0
+            lock = Lock()
+
+            def complete(*args, **kwargs):
+                nonlocal active, peak, calls
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    calls += 1
+                time.sleep(0.02)
+                with lock:
+                    active -= 1
+                return EMPTY
+
+            with self.subTest(provider=provider), patch.dict(os.environ, {"CLI_MAX_CONCURRENT_LANES": "2"}), patch(
+                f"lucid.web.{provider}.resolve_model", return_value="cli-model",
+            ), patch("lucid.web.context.build_context", return_value="CONTEXT"), patch(
+                "lucid.web.llm.complete", side_effect=complete,
+            ), patch("lucid.web.ThreadPoolExecutor", wraps=ThreadPoolExecutor) as executor:
+                job = self.wait(self.start(provider=provider)["id"])
+                executor.assert_called_once_with(max_workers=2, thread_name_prefix="lucid-lane")
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(calls, 6)
+            self.assertLessEqual(peak, 2)
+            self.assertTrue(all(lane["status"] == "completed" for lane in job["lanes"]))
+
+    def test_invalid_cli_lane_limit_rejected_before_model_resolution(self):
+        with patch.dict(os.environ, {"CLI_MAX_CONCURRENT_LANES": "0"}), patch(
+            "lucid.web.codex.resolve_model",
+        ) as resolve, self.assertRaises(HTTPException) as raised:
+            self.start(provider="codex")
+        self.assertEqual(raised.exception.status_code, 400)
+        resolve.assert_not_called()
+
     def test_six_concurrent_sequential_lanes_exclusion_and_judge_contract(self):
         barriers = [Barrier(6), Barrier(6)]
         judge_entered, release_judge = Event(), Event()

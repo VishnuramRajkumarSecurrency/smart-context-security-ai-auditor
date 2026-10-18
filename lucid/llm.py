@@ -42,6 +42,16 @@ def provider_kind(provider: str | None = None) -> str:
     return "codex" if codex.executable() else "api"
 
 
+def lane_workers(total_lanes: int, provider: str | None = None) -> int:
+    """Limit specialist fan-out per audit for CLI providers, not API providers."""
+    if provider_kind(provider) not in ("kiro", "codex"):
+        return total_lanes
+    raw = os.environ.get("CLI_MAX_CONCURRENT_LANES", "2").strip()
+    if raw not in ("1", "2", "3", "4", "5", "6"):
+        raise ValueError("CLI_MAX_CONCURRENT_LANES must be an integer from 1 to 6.")
+    return min(total_lanes, int(raw))
+
+
 def provider_ready(provider: str | None = None) -> bool:
     kind = provider_kind(provider)
     if kind in ("kiro", "codex"):
