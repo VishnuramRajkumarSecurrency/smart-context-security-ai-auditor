@@ -1,0 +1,166 @@
+# ---------------------------------------------------------------------------
+# Lucid PR security review via KIRO CLI (no AI API key needed)
+#
+# Use this variant when the pipeline cannot hold an OpenAI/Requesty API key.
+# Lucid drives `kiro-cli` instead, which uses the agent's own Kiro login.
+#
+# HARD REQUIREMENT: a SELF-HOSTED agent that has been logged in to kiro-cli
+# once. Microsoft-hosted agents will NOT work — they are wiped each run and an
+# automated PR build cannot complete the interactive/device-flow login. (See
+# the "Hosted-agent alternative" note at the bottom if you truly cannot use a
+# self-hosted agent.)
+#
+# ONE-TIME SETUP on the self-hosted agent, as the SAME OS user the Azure DevOps
+# agent service runs as (so $HOME matches at build time):
+#   1. Install kiro-cli and ensure it is on PATH (or set LUCID_KIRO_CLI below).
+#   2. Log in once:
+#        kiro-cli login                 # browser available
+#        kiro-cli login --use-device-flow   # headless box: shows a code+URL
+#   3. That caches a token under ~/.aws/sso/cache that kiro-cli auto-refreshes.
+#      You only need to log in again when the refresh token eventually expires.
+#
+# WHERE THIS GOES: commit it in your *contracts* repo and attach it as a Build
+# Validation branch policy on the target branch (same as the API sample).
+# ---------------------------------------------------------------------------
+
+trigger: none  # runs as PR build validation via branch policy
+
+# A self-hosted pool/agent that is logged in to kiro-cli. Replace the name.
+pool:
+  name: YourSelfHostedPool
+  # Optionally pin a specific logged-in agent:
+  # demands:
+  #   - Agent.Name -equals your-logged-in-agent
+
+resources:
+  repositories:
+    - repository: agent
+      type: git
+      name: YourProject/smart-context-security-ai-auditor
+      ref: refs/heads/main
+
+variables:
+  failOn: high            # critical | high | medium | low | none
+  auditMode: context      # single | context | loop | specialists
+  srcDir: contracts       # repo-relative Solidity source dir
+  kiroModel: claude-opus-5   # or claude-sonnet-4.5 for faster/cheaper, more reliable runs
+  # If kiro-cli is not on PATH for the agent service user, set its absolute path:
+  # kiroCliPath: /usr/local/bin/kiro-cli
+
+steps:
+  - checkout: self
+    fetchDepth: 0          # full history so the PR's merge-base is diffable
+    path: contracts
+
+  - checkout: agent
+    path: agent
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+    displayName: Use Python 3.11
+
+  - script: |
+      set -euo pipefail
+      python -m venv .venv
+      . .venv/bin/activate
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    workingDirectory: $(Agent.BuildDirectory)/agent
+    displayName: Install agent dependencies
+
+  # Fail fast (and for FREE) if the agent is not logged in. list_models() opens
+  # a kiro-cli ACP session and does initialize + session/new only — no prompt,
+  # no inference, no Kiro credits consumed. If it errors, the agent needs a
+  # (re)login; the audit below would otherwise burn time before failing.
+  - script: |
+      set -euo pipefail
+      command -v kiro-cli >/dev/null 2>&1 || [ -x "$(kiroCliPath)" ] || {
+        echo "kiro-cli not found on PATH. Install it on this agent or set kiroCliPath."; exit 1; }
+      kiro-cli --version || true
+      . $(Agent.BuildDirectory)/agent/.venv/bin/activate
+      cd $(Agent.BuildDirectory)/agent
+      python -c "from lucid import kiro; n=len(kiro.list_models()); print(f'kiro-cli authenticated OK ({n} models)')" || {
+        echo "kiro-cli is NOT authenticated on this agent.";
+        echo "Log in once as the agent service user: kiro-cli login  (or: kiro-cli login --use-device-flow)";
+        exit 1; }
+    displayName: Verify kiro-cli auth (no credits)
+    env:
+      LUCID_PROVIDER: kiro
+      # LUCID_KIRO_CLI: $(kiroCliPath)
+
+  - script: |
+      set -euo pipefail
+      . $(Agent.BuildDirectory)/agent/.venv/bin/activate
+
+      CONTRACTS="$(Agent.BuildDirectory)/contracts"
+      TARGET="${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}"
+      git -C "$CONTRACTS" fetch --no-tags origin "$TARGET"
+
+      python -m lucid.ci \
+        --repo "$CONTRACTS" \
+        --base "origin/$TARGET" \
+        --head HEAD \
+        --src "$(srcDir)" \
+        --context-scope repo \
+        --provider kiro \
+        --model "$(kiroModel)" \
+        --mode "$(auditMode)" \
+        --fail-on "$(failOn)" \
+        --report "$(Build.ArtifactStagingDirectory)/pr-audit.json" \
+        --summary "$(Build.ArtifactStagingDirectory)/pr-audit.md"
+    workingDirectory: $(Agent.BuildDirectory)/agent
+    displayName: Lucid PR security review (Kiro CLI)
+    env:
+      LUCID_PROVIDER: kiro
+      # LUCID_KIRO_CLI: $(kiroCliPath)
+
+  - task: PublishBuildArtifacts@1
+    condition: always()   # publish even when the gate fails the build
+    inputs:
+      PathtoPublish: $(Build.ArtifactStagingDirectory)/pr-audit.json
+      ArtifactName: lucid-pr-audit
+    displayName: Publish audit report
+
+  # OPTIONAL: post the Markdown summary as a PR comment. Needs the build service
+  # identity to have "Contribute to pull requests" and access to System.AccessToken.
+  - script: |
+      set -euo pipefail
+      SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/pr-audit.md"
+      [ -f "$SUMMARY_FILE" ] || { echo "no summary to post"; exit 0; }
+      CONTENT=$(python -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' "$SUMMARY_FILE")
+      BODY="{\"comments\":[{\"parentCommentId\":0,\"content\":$CONTENT,\"commentType\":1}],\"status\":1}"
+      URL="$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.0"
+      curl -sS -X POST "$URL" -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(System.AccessToken)" -d "$BODY" >/dev/null
+      echo "Posted audit summary to PR #$(System.PullRequest.PullRequestId)."
+    condition: always()
+    displayName: Comment audit summary on PR (optional)
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+# ---------------------------------------------------------------------------
+# NOTES
+#
+# CREDITS / CONCURRENCY: each audit consumes the logged-in account's Kiro
+# subscription. `specialists` mode opens up to 2 concurrent kiro-cli processes
+# (lucid caps CLI lane concurrency); other modes are sequential. `context` is
+# the cheapest useful default. Pin a specific model via `kiroModel`.
+#
+# HOME MUST MATCH: kiro-cli reads its token from the login user's $HOME. The
+# pipeline must run as that same user. If your agent runs as a service account,
+# log in as that account.
+#
+# HOSTED-AGENT ALTERNATIVE (fragile, not recommended): if you cannot use a
+# self-hosted agent, you can store the token cache as an Azure DevOps Secure
+# File and restore it before the audit:
+#   - task: DownloadSecureFile@1
+#     name: kiroToken
+#     inputs: { secureFile: kiro-auth-token.json }
+#   - script: |
+#       mkdir -p "$HOME/.aws/sso/cache"
+#       cp "$(kiroToken.secureFilePath)" "$HOME/.aws/sso/cache/kiro-auth-token.json"
+# This only works while the token is valid, breaks when it rotates on refresh,
+# and means managing a sensitive credential as a pipeline secret. Prefer a
+# self-hosted, logged-in agent.
+# ---------------------------------------------------------------------------

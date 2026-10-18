@@ -1,0 +1,164 @@
+# ---------------------------------------------------------------------------
+# Lucid PR security review — sample Azure DevOps pipeline
+#
+# WHERE THIS GOES: commit this file in your *contracts* repository (the repo
+# whose pull requests you want reviewed), not in the agent repo. Then add it as
+# a Build Validation branch policy on your target branch:
+#   Project Settings -> Repositories -> <repo> -> Policies -> Branch policies
+#   -> Build validation -> + -> select this pipeline.
+# Azure Repos PR triggers come from that branch policy, not from a `pr:` block.
+#
+# WHAT IT DOES: on each PR, it checks out your contracts and the Lucid agent
+# repo side by side, installs the agent's Python deps, then runs
+# `python -m lucid.ci` to diff the PR, audit only the changed Solidity, publish
+# a JSON + Markdown report artifact, optionally comment on the PR, and fail the
+# build when findings reach the configured severity gate.
+#
+# PROVIDER: this sample uses the API provider (an OpenAI-compatible gateway such
+# as Requesty) because it authenticates cleanly in CI with a secret variable.
+# See the commented Kiro CLI block near the bottom for that option and its
+# important auth caveat.
+# ---------------------------------------------------------------------------
+
+# No `trigger:` — this runs as PR build validation via branch policy.
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+# Pull the Lucid agent repo alongside your contracts. Point `name` at the
+# project/repo path of the agent repo in your Azure DevOps org, or use a
+# `type: github` resource with a service connection if it lives on GitHub.
+resources:
+  repositories:
+    - repository: agent
+      type: git
+      name: YourProject/smart-context-security-ai-auditor
+      ref: refs/heads/main
+
+variables:
+  # Severity gate: fail the PR on findings at or above this level.
+  # One of: critical | high | medium | low | none  (none = report only).
+  failOn: high
+  # Audit depth: single | context | loop | specialists.
+  # `context` is the recommended CI default — one context pass + one hunt,
+  # fast and cheap. `specialists` is far more thorough but much slower/pricier.
+  auditMode: context
+  # Repo-relative directory holding your Solidity sources (used for scope and
+  # for cross-contract protocol context). Adjust to your layout.
+  srcDir: contracts
+
+steps:
+  # Full history so the PR's target branch and merge-base are available to diff.
+  - checkout: self
+    fetchDepth: 0
+    path: contracts
+
+  - checkout: agent
+    path: agent
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+    displayName: Use Python 3.11
+
+  - script: |
+      set -euo pipefail
+      python -m venv .venv
+      . .venv/bin/activate
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    workingDirectory: $(Agent.BuildDirectory)/agent
+    displayName: Install agent dependencies
+
+  - script: |
+      set -euo pipefail
+      . $(Agent.BuildDirectory)/agent/.venv/bin/activate
+
+      CONTRACTS="$(Agent.BuildDirectory)/contracts"
+      # System.PullRequest.TargetBranch looks like 'refs/heads/main'; the audit
+      # diffs against the remote-tracking ref, so fetch it and strip the prefix.
+      TARGET="${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}"
+      git -C "$CONTRACTS" fetch --no-tags origin "$TARGET"
+
+      python -m lucid.ci \
+        --repo "$CONTRACTS" \
+        --base "origin/$TARGET" \
+        --head HEAD \
+        --src "$(srcDir)" \
+        --context-scope repo \
+        --mode "$(auditMode)" \
+        --fail-on "$(failOn)" \
+        --report "$(Build.ArtifactStagingDirectory)/pr-audit.json" \
+        --summary "$(Build.ArtifactStagingDirectory)/pr-audit.md"
+    workingDirectory: $(Agent.BuildDirectory)/agent
+    displayName: Lucid PR security review
+    env:
+      # --- API provider (recommended for CI) ---------------------------------
+      # Define these as SECRET pipeline variables (Pipelines -> Edit -> Variables,
+      # or a linked variable group). Secrets are not auto-mapped into scripts,
+      # so they must be passed through explicitly here.
+      LUCID_PROVIDER: api
+      OPENAI_API_KEY: $(OPENAI_API_KEY)       # your Requesty (or OpenAI) key
+      OPENAI_BASE_URL: $(OPENAI_BASE_URL)     # e.g. https://router.requesty.ai/v1
+      OPENAI_MODEL: $(OPENAI_MODEL)           # e.g. a model ID from your gateway
+
+  # Publish the report even when the gate fails the build, so reviewers can read
+  # it. `always()` ensures this runs after a non-zero audit exit code.
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: $(Build.ArtifactStagingDirectory)/pr-audit.json
+      ArtifactName: lucid-pr-audit
+    displayName: Publish audit report
+
+  # OPTIONAL: post the Markdown summary as a PR comment. Requires that the build
+  # service identity has "Contribute to pull requests" on the repo, and that the
+  # job is allowed to access System.AccessToken (Project Settings -> Pipelines).
+  - script: |
+      set -euo pipefail
+      SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/pr-audit.md"
+      [ -f "$SUMMARY_FILE" ] || { echo "no summary to post"; exit 0; }
+      # Build a JSON thread body from the Markdown summary.
+      CONTENT=$(python -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' "$SUMMARY_FILE")
+      BODY="{\"comments\":[{\"parentCommentId\":0,\"content\":$CONTENT,\"commentType\":1}],\"status\":1}"
+      URL="$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.0"
+      curl -sS -X POST "$URL" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(System.AccessToken)" \
+        -d "$BODY" >/dev/null
+      echo "Posted audit summary to PR #$(System.PullRequest.PullRequestId)."
+    condition: always()
+    displayName: Comment audit summary on PR (optional)
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+# ---------------------------------------------------------------------------
+# ALTERNATIVE PROVIDER — Kiro CLI (model-agnostic, no API key)
+#
+# Replace the "Install agent dependencies" + review steps' provider wiring with
+# a Kiro CLI setup if you prefer it. IMPORTANT CAVEATS before you do:
+#
+#   1. AUTH IN CI IS THE HARD PART. `kiro-cli acp` needs an authenticated
+#      session. `kiro-cli login` is interactive and will not work unattended on
+#      a hosted agent. You need a non-interactive auth method (a pre-provisioned
+#      credential/token the CLI accepts) or a self-hosted agent that is already
+#      logged in. Confirm your Kiro CLI build supports non-interactive auth
+#      before relying on this in a pipeline.
+#   2. SELF-HOSTED AGENTS BEHIND A TLS-INSPECTING PROXY (e.g. Zscaler) may fail
+#      Python HTTPS verification; the API provider's SDK and GitHub previews use
+#      certifi's CA bundle, which won't include a corporate root CA by default.
+#      Microsoft-hosted agents don't have this issue.
+#
+# Sketch (once auth is solved):
+#   - script: |
+#       curl -fsSL <kiro-cli-install-url> -o kiro-cli && chmod +x kiro-cli
+#       sudo mv kiro-cli /usr/local/bin/
+#       # ...provision non-interactive auth here...
+#     displayName: Install Kiro CLI
+#   # then run lucid.ci with these env instead of the API vars:
+#     env:
+#       LUCID_PROVIDER: kiro
+#       LUCID_KIRO_MODEL: claude-opus-5     # or claude-sonnet-4.5 for speed
+#       LUCID_KIRO_CLI: /usr/local/bin/kiro-cli
+# ---------------------------------------------------------------------------
