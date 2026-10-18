@@ -2,3 +2,5 @@
 .venv
 __pycache__/
 *.pyc
+# Local-only npm registry config (internal Azure Artifacts URL); keep out of the fork.
+ui/.npmrc
