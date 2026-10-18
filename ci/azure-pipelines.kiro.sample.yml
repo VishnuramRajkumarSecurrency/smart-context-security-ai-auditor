@@ -35,9 +35,10 @@ pool:
 resources:
   repositories:
     - repository: agent
-      type: git
-      name: YourProject/smart-context-security-ai-auditor
-      ref: refs/heads/main
+      type: github
+      name: VishnuramRajkumarSecurrency/smart-context-security-ai-auditor
+      endpoint: <your-github-service-connection>   # ADO: Project Settings -> Service connections -> GitHub
+      ref: refs/heads/master
 
 variables:
   failOn: high            # critical | high | medium | low | none
